@@ -1,9 +1,34 @@
 #!/usr/bin/env python3
-"""Novyra 0.2.1: a multi-agent company operating system for your terminal.
+"""Novyra 0.2.2: a multi-agent company operating system for your terminal.
 
 The Owner (you) sits at the top. The CEO Agent coordinates a 57-entry
 blueprint (48 agents + 9 shared systems) across six departments: core
 management, Betting, Ecommerce, Marketing, Trading and Finance.
+
+Changelog 0.2.2 (from 0.2.1)
+----------------------------
+* Exact money math: all monetary limits are compared in integer cents
+  through Decimal, never in binary floats. A stake that displays as
+  exactly the risk cap is now accepted (previously a raw cap like
+  2.007 could round up to a rejectable 2.01). The cap itself
+  truncates fractional cents (never rounds up), the Risk Manager
+  proposes stakes already floored to the cap, and win credits round
+  half-up in cents, so placement, settlement and the ledger invariant
+  agree to the cent in every case.
+* Reliable database lifecycle: Database.close() and Runtime.close()
+  are idempotent, both support the 'with' statement, a failed
+  database open releases its connection, and the CLI closes the
+  session through Runtime.close() on the way out. The test suite
+  closes every runtime it opens, so no SQLite connection outlives
+  its test and no resource warnings remain.
+* Complete Guardian action audit: every sensitive action attempt now
+  reaches the actions table, not only successful ones. Owner
+  approvals and denials, emergency-stop blocks, emergency stop and
+  resume, autonomy changes, data resets, refused bet placements
+  (below minimum, over cap, insufficient bankroll) and refused
+  settlements (unknown bet, already settled) are all recorded with
+  their outcome, so the Guardian's watch covers the full permission
+  and approval system.
 
 Changelog 0.2.1 (from 0.2.0)
 ----------------------------
@@ -95,8 +120,9 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 
 # ---------------------------------------------------------------- utilities
@@ -150,6 +176,24 @@ def money(x):
 
 def pct(p):
     return "%.1f%%" % (p * 100.0)
+
+
+def to_cents(amount):
+    """Convert a monetary amount to integer cents, rounding half-up.
+
+    Decimal keeps the conversion free of binary floating-point error:
+    2.005 is exactly 200.5 cents and rounds to 201 (2.01), while the
+    old float round() silently gave 2.00 or 2.01 depending on the
+    bit pattern. All limit checks in the betting book compare cents,
+    so a stake that displays as exactly the cap is accepted.
+    """
+    return int((Decimal(str(float(amount))) * 100).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def from_cents(cents):
+    """Integer cents back to a float with at most two decimals."""
+    return cents / 100.0
 
 
 # ---------------------------------------------------------------- exceptions
@@ -275,23 +319,45 @@ TABLES = ("kv", "log", "memory", "tasks", "decisions", "approvals",
 
 class Database:
     """SQLite persistence layer. One instance per session, every write
-    commits immediately so a crash loses at most one action."""
+    commits immediately so a crash loses at most one action. close()
+    is idempotent and the object works as a context manager, so the
+    connection is always released cleanly."""
 
     def __init__(self, path):
         self.path = path
+        self.closed = False
+        self.conn = None
         try:
             self.conn = sqlite3.connect(path)
             self.conn.row_factory = sqlite3.Row
             self.conn.executescript(SCHEMA)
             self.conn.commit()
         except sqlite3.Error as e:
+            # never leak a half-open connection on a failed open
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except sqlite3.Error:
+                    pass
+            self.closed = True
             raise NovyraError("Cannot open database %s: %s" % (path, e))
 
     def close(self):
+        """Close the connection. Safe to call more than once."""
+        if self.closed:
+            return
+        self.closed = True
         try:
             self.conn.close()
         except sqlite3.Error:
             pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     @contextmanager
     def transact(self):
@@ -591,8 +657,12 @@ class BettingBook:
     matches the exact bet by id, re-checks that it is still open
     inside the same transaction that pays out (so double settlement
     cannot pay twice), and credits stake times odds back on a win.
-    All money values are rounded to cents, so the ledger invariant
-    (bankroll = initial + realised PnL - open exposure) holds exactly.
+    All money values are handled as integer cents (Decimal
+    conversion, never binary floats), so the ledger invariant
+    (bankroll = initial + realised PnL - open exposure) holds to the
+    cent and a stake that displays as exactly the cap is accepted.
+    Every placement and settlement attempt, successful or refused,
+    is recorded in the Guardian's actions table.
     """
 
     def __init__(self, db):
@@ -615,6 +685,7 @@ class BettingBook:
 
     def place(self, match_name, outcome, odds, prob, stake,
               source="simulated", actor=None):
+        actor = actor or "Betting Portfolio Manager"
         if outcome not in OUTCOMES:
             raise BettingError("outcome must be one of %s"
                                % ", ".join(OUTCOMES))
@@ -622,61 +693,102 @@ class BettingBook:
             raise BettingError("odds must be above 1.0, got %.2f" % odds)
         if not 0.0 < prob < 1.0:
             raise BettingError("prob must be strictly between 0 and 1")
-        stake = round(float(stake), 2)
-        if stake < MIN_STAKE:
+        # canonical stake: integer cents, half-up, so display, ledger
+        # and limit checks all agree
+        stake_cents = to_cents(stake)
+        if stake_cents < to_cents(MIN_STAKE):
+            self.db.action_add(actor, "place bet",
+                               "refused: stake %.2f is below the %.2f "
+                               "minimum"
+                               % (from_cents(stake_cents), MIN_STAKE), 0)
             raise BettingError("stake %.2f is below the %.2f minimum"
-                               % (stake, MIN_STAKE))
-        with self.db.transact():
-            bankroll = float(self.db.kv_get("bankroll"))
-            cap = MAX_STAKE_FRACTION * bankroll
-            if stake > cap + 1e-9:
-                raise BettingError("stake %.2f exceeds the %.2f cap "
-                                   "(%.0f%% of bankroll)"
-                                   % (stake, cap,
-                                      MAX_STAKE_FRACTION * 100))
-            if stake > bankroll + 1e-9:
-                raise BettingError("insufficient bankroll: %.2f available"
-                                   % bankroll)
-            self.db.kv_set("bankroll", "%.2f" % (bankroll - stake),
-                           commit=False)
-            bet_id = self.db.bet_add(match_name, outcome, stake, odds,
-                                     prob, source, commit=False)
-        self.db.action_add(actor or "Betting Portfolio Manager",
-                           "place bet",
+                               % (from_cents(stake_cents), MIN_STAKE))
+        try:
+            with self.db.transact():
+                bankroll_cents = to_cents(self.db.kv_get("bankroll"))
+                # the cap truncates fractional cents: it can never be
+                # rounded up into a stake the book then refuses
+                cap_cents = int(Decimal(str(MAX_STAKE_FRACTION))
+                                * bankroll_cents)
+                if stake_cents > cap_cents:
+                    raise BettingError(
+                        "stake %.2f exceeds the %.2f cap "
+                        "(%.0f%% of bankroll)"
+                        % (from_cents(stake_cents),
+                           from_cents(cap_cents),
+                           MAX_STAKE_FRACTION * 100))
+                if stake_cents > bankroll_cents:
+                    raise BettingError(
+                        "insufficient bankroll: %.2f available"
+                        % from_cents(bankroll_cents))
+                self.db.kv_set(
+                    "bankroll",
+                    "%.2f" % from_cents(bankroll_cents - stake_cents),
+                    commit=False)
+                bet_id = self.db.bet_add(match_name, outcome,
+                                         from_cents(stake_cents), odds,
+                                         prob, source, commit=False)
+        except BettingError as e:
+            # nothing was written (the transaction rolled back);
+            # the refusal itself is audited for the Guardian
+            self.db.action_add(actor, "place bet",
+                              "refused: %s" % e, 0)
+            raise
+        self.db.action_add(actor, "place bet",
                            "#%d %s on %s, stake %.2f (SIMULATED)"
-                           % (bet_id, match_name, outcome, stake), 1)
+                           % (bet_id, match_name, outcome,
+                              from_cents(stake_cents)), 1)
         return bet_id
 
     def settle(self, bet_id, result, result_source="simulated",
                actor=None):
+        actor = actor or "Post-Match Review"
         if result not in OUTCOMES:
             raise BettingError("result must be one of %s"
                                % ", ".join(OUTCOMES))
-        with self.db.transact():
-            bet = self.db.bet_get(bet_id)
-            if bet is None:
-                raise BettingError("no bet with id #%d" % bet_id)
-            if bet["status"] != "open":
-                raise BettingError("bet #%d is already settled" % bet_id)
-            won = (bet["outcome"] == result)
-            if won:
-                credit = round(bet["stake"] * bet["odds"], 2)
-                pnl = round(credit - bet["stake"], 2)
-            else:
-                credit = 0.0
-                pnl = -round(bet["stake"], 2)
-            # the guarded UPDATE makes double settlement impossible
-            self.db.bet_settle(bet_id, result, result_source, pnl,
-                               commit=False)
-            if credit:
-                bankroll = float(self.db.kv_get("bankroll"))
-                self.db.kv_set("bankroll", "%.2f" % (bankroll + credit),
-                               commit=False)
-        self.db.action_add(actor or "Post-Match Review", "settle bet",
+        try:
+            with self.db.transact():
+                bet = self.db.bet_get(bet_id)
+                if bet is None:
+                    raise BettingError("no bet with id #%d" % bet_id)
+                if bet["status"] != "open":
+                    raise BettingError("bet #%d is already settled"
+                                       % bet_id)
+                won = (bet["outcome"] == result)
+                stake_cents = to_cents(bet["stake"])
+                if won:
+                    # credit rounds half-up in exact cents, and the
+                    # PnL is derived from the same credit that the
+                    # bankroll receives, so they can never diverge
+                    credit_cents = int(
+                        (Decimal(str(bet["stake"]))
+                         * Decimal(str(bet["odds"]))
+                         * 100).quantize(Decimal("1"),
+                                         rounding=ROUND_HALF_UP))
+                    pnl_cents = credit_cents - stake_cents
+                else:
+                    credit_cents = 0
+                    pnl_cents = -stake_cents
+                # the guarded UPDATE makes double settlement impossible
+                self.db.bet_settle(bet_id, result, result_source,
+                                   from_cents(pnl_cents), commit=False)
+                if credit_cents:
+                    bankroll_cents = to_cents(self.db.kv_get("bankroll"))
+                    self.db.kv_set(
+                        "bankroll",
+                        "%.2f" % from_cents(bankroll_cents
+                                            + credit_cents),
+                        commit=False)
+        except BettingError as e:
+            self.db.action_add(actor, "settle bet",
+                               "refused: %s" % e, 0)
+            raise
+        self.db.action_add(actor, "settle bet",
                            "#%d result %s (%s): %s, PnL %+.2f"
                            % (bet_id, result, result_source,
-                              "won" if won else "lost", pnl), 1)
-        return won, pnl
+                              "won" if won else "lost",
+                              from_cents(pnl_cents)), 1)
+        return won, from_cents(pnl_cents)
 
     def settled_rows(self):
         return [r for r in self.db.bets_all() if r["status"] != "open"]
@@ -850,6 +962,12 @@ class Permissions:
             action, (": %s" % detail) if detail else "")
         granted = self.runtime.ask_owner(question)
         self.runtime.db.approval_add(action, detail, granted)
+        # the Owner's decision is a sensitive action: it reaches the
+        # Guardian's watch, granted or denied
+        self.runtime.db.action_add(
+            "Owner", action,
+            ("approved: %s" % detail) if detail else "approved",
+            1 if granted else 0)
         self.runtime.db.log("Owner", "approved" if granted else "denied",
                             "%s %s" % (action, detail))
         if not granted:
@@ -864,16 +982,23 @@ class Permissions:
                 "Guardian Agent", "blocked",
                 "%s attempted '%s' during emergency stop"
                 % (agent_name, action), level="warn")
+            self.runtime.db.action_add(
+                agent_name, action,
+                "blocked: emergency stop engaged", 0)
             return False
         return True
 
     def halt(self):
         self.runtime.db.kv_set("emergency_stop", "1")
+        self.runtime.db.action_add("Owner", "emergency stop",
+                                   "all agents halted", 1)
         self.runtime.db.log("Owner", "emergency stop",
                             "all agents halted", level="warn")
 
     def do_resume(self):
         self.runtime.db.kv_set("emergency_stop", "0")
+        self.runtime.db.action_add("Owner", "resume",
+                                   "agents back online", 1)
         self.runtime.db.log("Owner", "resume", "agents back online")
 
 
@@ -1524,8 +1649,15 @@ class BettingRiskManager(BettingWorker):
         book = self.runtime.book
         bankroll = book.bankroll
         frac = kelly_fraction(pick[1], pick[2])
-        stake = round(min(frac * bankroll,
-                          MAX_STAKE_FRACTION * bankroll), 2)
+        # stakes are computed and capped in exact integer cents: the
+        # cap truncates fractional cents and Kelly floors, so the
+        # pipeline can never propose a stake the book will refuse
+        bankroll_cents = to_cents(bankroll)
+        cap_cents = int(Decimal(str(MAX_STAKE_FRACTION)) * bankroll_cents)
+        kelly_cents = int((Decimal(str(frac)) * bankroll_cents).quantize(
+            Decimal("1"), rounding=ROUND_FLOOR))
+        stake_cents = min(kelly_cents, cap_cents)
+        stake = from_cents(stake_cents)
         match = "%s vs %s" % (ctx["fixture"]["home"], ctx["fixture"]["away"])
         same = sum(1 for b in book.open_bets()
                    if b["match_name"] == match)
@@ -1533,7 +1665,7 @@ class BettingRiskManager(BettingWorker):
             ctx["abort"] = ("Concentration limit: %d positions already "
                             "open on this match." % same)
             return "Risk view: concentration limit reached. Declined."
-        if stake < MIN_STAKE:
+        if stake_cents < to_cents(MIN_STAKE):
             ctx["abort"] = ("Edge too thin: Kelly stake %.2f is below "
                             "the %.2f minimum." % (stake, MIN_STAKE))
             return ("Risk view: Kelly fraction %.2f%% of bankroll gives "
@@ -1781,6 +1913,7 @@ SPECIAL_CLASSES = {
 
 class Runtime:
     def __init__(self, db_path=None, demo=False):
+        self._closed = False
         self.demo = demo
         if demo:
             path = ":memory:"
@@ -1818,6 +1951,27 @@ class Runtime:
         row = self.db.conn.execute(
             "SELECT MAX(id) AS m FROM log").fetchone()
         self.db.kv_set("watchdog_cursor", str(row["m"] or 0))
+
+    def close(self):
+        """Release the database connection cleanly. Idempotent: safe
+        to call from both a finally block and a context manager exit,
+        so tests and the CLI never leak an open SQLite connection."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.db.log("System", "shutdown",
+                        "Novyra v%s session closed" % VERSION)
+        except Exception:
+            pass
+        self.db.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
 
     # ----------------------------------------------------------- lookups
 
@@ -2050,6 +2204,10 @@ class Runtime:
 
     def set_autonomy(self, enabled):
         self.db.kv_set("sim_autonomy", "1" if enabled else "0")
+        self.db.action_add("Owner",
+                           "autonomy %s" % ("on" if enabled else "off"),
+                           "autonomous simulated betting %s"
+                           % ("enabled" if enabled else "disabled"), 1)
         self.db.log("Owner",
                     "autonomy %s" % ("on" if enabled else "off"),
                     "autonomous simulated betting %s"
@@ -2097,6 +2255,10 @@ class Runtime:
         self.db.kv_set("sim_autonomy", "0")
         self.db.log("Owner", "reset",
                     "operational data wiped", level="warn")
+        # the reset itself is a sensitive action: the wipe clears the
+        # watch, so the marker is written after it
+        self.db.action_add("Owner", "reset data",
+                           "operational data wiped by the Owner", 1)
         row = self.db.conn.execute(
             "SELECT MAX(id) AS m FROM log").fetchone()
         self.db.kv_set("watchdog_cursor", str(row["m"] or 0))
@@ -2780,7 +2942,7 @@ def main(argv=None):
     except SystemExit:
         pass
     finally:
-        rt.db.close()
+        rt.close()
 
 
 if __name__ == "__main__":
