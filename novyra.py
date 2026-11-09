@@ -2995,4 +2995,92 @@ class CLI:
 
     def banner(self):
         print(C.BOLD + C.MAGENTA + r"""
-    _   _                 ______
+    _   _                 ______    | \ | | _____   ____ _/ ____| __ _ _   _   _  __
+    |  \| |/ _ \ \ / / _` \___ \ / _` | | | \ \ / / /
+    | |\  | (_) \ V / (_| |___) | (_| | |_| |\ V / /
+    |_| \_|\___/ \_/ \__,_|____/ \__,_|\__, | \_/ /
+                                        |___/     /_/  v%s
+""" % VERSION + C.RESET)
+        print(wrap("A multi-agent company operating system. You are the "
+                   "Owner. The CEO Agent coordinates %d blueprint entries "
+                   "across 6 departments plus shared systems."
+                   % self.rt.blueprint_size()))
+        print(wrap("Type 'help' for commands, 'demo' for a guided tour, or "
+                   "just talk to the CEO."))
+        print(wrap("Mode: simulation with synthetic data. No real money "
+                   "moves and no external betting services are called.",
+                   "  " + C.DIM))
+        print(wrap("Autonomous simulated betting: %s."
+                   % ("ENABLED (scans act on their own)"
+                      if self.rt.sim_autonomy
+                      else "disabled (each simulated bet needs your "
+                           "approval)"),
+                   "  " + C.DIM))
+        if self.rt.demo:
+            print(wrap("DEMO MODE: approvals are auto-granted and the "
+                       "database is a throwaway in-memory copy. Nothing "
+                       "you do here is saved.", "  " + C.RED))
+        if self.rt.permissions.emergency_stop:
+            print(wrap("EMERGENCY STOP IS ENGAGED from a previous "
+                       "session. All agents are halted until you run "
+                       "'resume' with approval.", "  " + C.RED))
+
+    def repl(self):
+        self.banner()
+        while True:
+            try:
+                line = input("%snovyra>%s " % (C.BOLD + C.GREEN,
+                                              C.RESET)).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                self.cmd_exit("")
+            if not line:
+                continue
+            self.dispatch(line)
+
+    def run_demo(self):
+        self.banner()
+        script = [
+            "status",
+            "agents",
+            "activate Betting Department",
+            "autonomy on",
+            "scan",
+            "scan",
+            "bets",
+            "report",
+            "meeting Betting Department",
+            "do Data Collector review this week's fixtures",
+            "propose Ecommerce Manager",
+            "guardian",
+            "messages",
+            "log 20",
+        ]
+        for cmd in script:
+            print("\n%s%snovyra> %s%s" % (C.DIM, C.BOLD, cmd, C.RESET))
+            self.dispatch(cmd)
+        print(wrap("[CEO] That concludes the demo. In interactive mode you "
+                   "approve actions yourself, and everything persists to "
+                   "the database. Type 'help' for everything.",
+                   "  " + C.DIM))
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    C.off()
+    demo = "--demo" in argv
+    rt = Runtime(demo=demo)
+    cli = CLI(rt)
+    try:
+        if demo:
+            cli.run_demo()
+        else:
+            cli.repl()
+    except SystemExit:
+        pass
+    finally:
+        rt.close()
+
+
+if __name__ == "__main__":
+    main()
