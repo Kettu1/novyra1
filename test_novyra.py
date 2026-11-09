@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automated test suite for Novyra 0.2.2.
+"""Automated test suite for Novyra 0.3.0-dev (develop/0.3.0).
 
 Place this file next to novyra.py, then run:
 
@@ -15,6 +15,14 @@ watchdog, agent action execution via the LLM planner (including
 refusal of unsafe actions), complete auditing of sensitive actions
 in the actions table, reliable database connection cleanup, agent
 roster uniqueness, LLM fallback behaviour, and CLI input validation.
+
+New for 0.3.0-dev Phase 0: demo isolation (the 'demo' command never
+touches the live session and never asks the live Owner), the
+aggregate exposure cap (exact boundary, one-cent-over rejection,
+headroom freed by settlement, Guardian consistency and tamper
+detection), and owner-settled vs model-settled reporting separation
+(PnL helpers, 'bets' output tags and the manager report's headline
+win rate, which counts only Owner-supplied results).
 No network access or LLM endpoint is required.
 
 Every runtime and database opened by a test is closed in teardown,
@@ -24,6 +32,8 @@ resource warnings. Run it with warnings as errors to verify:
     python3 -W error::ResourceWarning test_novyra.py
 """
 
+import contextlib
+import io
 import os
 import sqlite3
 import sys
@@ -899,6 +909,213 @@ class TestAuditLogging(NovyraCase):
         row = self._last_action(rt)
         self.assertEqual(row["actor"], "Owner")
         self.assertEqual(row["action"], "reset data")
+
+
+class TestDemoIsolation(NovyraCase):
+    """Phase 0 / audit E1: the 'demo' command runs on a throwaway
+    in-memory runtime. Nothing the demo does reaches the live
+    session, and the demo never asks the live Owner for anything."""
+
+    def test_demo_command_leaves_the_live_session_untouched(self):
+        rt = make_runtime()
+        rt.activate_department("Betting Department")
+        rt.book.place("A vs B", "home win", 2.5, 0.45, 100.0)
+        before = {
+            "bankroll": rt.book.bankroll,
+            "bets": len(rt.db.bets_all()),
+            "actions": rt.db.actions_count(),
+            "approvals": rt.db.approvals_count(),
+            "autonomy": rt.sim_autonomy,
+            "agents": len(rt.agents),
+            "tasks": len(rt.db.tasks_all()),
+            "messages": rt.db.messages_count(),
+        }
+        asked = []
+        rt.ask_owner = lambda question: asked.append(question) or True
+        cli = N.CLI(rt)
+        cli.dispatch("demo")
+        # the demo runs on its own runtime: the live Owner is never
+        # prompted for an approval, and no live state moves
+        self.assertEqual(asked, [])
+        self.assertAlmostEqual(rt.book.bankroll, before["bankroll"])
+        self.assertFalse(rt.sim_autonomy)
+        self.assertEqual(rt.sim_autonomy, before["autonomy"])
+        self.assertEqual(len(rt.db.bets_all()), before["bets"])
+        self.assertEqual(len(rt.db.tasks_all()), before["tasks"])
+        self.assertEqual(len(rt.agents), before["agents"])
+        self.assertEqual(rt.db.messages_count(), before["messages"])
+        self.assertEqual(rt.db.actions_count(), before["actions"])
+        self.assertEqual(rt.db.approvals_count(), before["approvals"])
+        # the live session still works normally afterwards
+        cli.dispatch("bets")
+        self.assertAlmostEqual(rt.book.bankroll, before["bankroll"])
+
+
+class TestAggregateExposure(NovyraCase):
+    """Phase 0 / audit E2: total open exposure is capped at 10% of
+    the bankroll, enforced transactionally at placement and measured
+    against the post-placement state, so the Guardian's 10% scan can
+    never flag a bet the book accepted.
+
+    The per-bet cap is 2% of the current bankroll, which shrinks
+    with every placement, so four successive maximum bets are
+    200.00, 196.00, 192.08 and 188.23 (all in integer cents, never
+    rounded up). After them the bankroll is 9223.69 with 776.31 at
+    risk (8.4%), and the aggregate cap allows exactly one more
+    132.78 stake (909.09 = int(0.10 * 909091)); one cent more is
+    refused."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.book = self.rt.book
+
+    def _place(self, stake):
+        return self.book.place("A vs B", "home win", 2.5, 0.45, stake)
+
+    def _fill_with_four_max_bets(self):
+        self._place(200.0)
+        self._place(196.0)
+        self._place(192.08)
+        self._place(188.23)
+
+    def test_fifth_max_bet_is_rejected_by_the_aggregate_cap(self):
+        # four successive per-bet caps fill exposure to 776.31 on a
+        # 9223.69 bankroll; the fifth cap-sized bet (184.47) would
+        # push exposure to 960.78 over the 903.92 aggregate limit
+        self._fill_with_four_max_bets()
+        self.assertAlmostEqual(self.book.bankroll, 9223.69)
+        self.assertAlmostEqual(self.book.open_exposure(), 776.31)
+        with self.assertRaises(N.BettingError) as cm:
+            self._place(184.47)
+        self.assertIn("exposure", str(cm.exception))
+        self.assertEqual(len(self.book.open_bets()), 4)
+        self.assertAlmostEqual(self.book.bankroll, 9223.69)
+
+    def test_aggregate_boundary_exact_and_one_cent_over(self):
+        # after the four max bets the largest legal stake is exactly
+        # 132.78: exposure 909.09 equals int(0.10 * 909091)
+        self._fill_with_four_max_bets()
+        self._place(132.78)
+        self.assertEqual(len(self.book.open_bets()), 5)
+        self.assertAlmostEqual(self.book.open_exposure(), 909.09)        self.assertAlmostEqual(self.book.bankroll, 9090.91)
+        # one cent more is refused and audited
+        with self.assertRaises(N.BettingError) as cm:
+            self._place(132.79)
+        self.assertIn("exposure", str(cm.exception))
+        self.assertEqual(len(self.book.open_bets()), 5)
+        self.assertAlmostEqual(self.book.bankroll, 9090.91)
+        self.assertEqual(self.rt.db.actions_count(allowed=False), 1)
+
+    def test_settlement_frees_exposure_headroom(self):
+        ids = [self._place(200.0), self._place(196.0),
+               self._place(192.08), self._place(188.23)]
+        with self.assertRaises(N.BettingError):
+            self._place(184.47)
+        # settling a bet as a loss frees its stake from the exposure
+        # without changing the bankroll (stakes are deducted up front)
+        self.book.settle(ids[0], "draw")
+        self.assertAlmostEqual(self.book.bankroll, 9223.69)
+        self._place(184.47)
+        self.assertEqual(len(self.book.open_bets()), 4)
+        self.assertAlmostEqual(self.book.bankroll, 9039.22)
+
+    def test_legal_placements_never_trip_the_guardian(self):
+        # fill exposure to exactly the legal maximum; the Guardian's
+        # exposure scan must stay silent because the enforcement uses
+        # the same post-placement state the scan will see
+        self._fill_with_four_max_bets()
+        self._place(132.78)
+        findings = self.rt.guardian.full_scan()
+        self.assertFalse(any("exposure" in f.lower()
+                             for f in findings))
+
+    def test_tampered_bankroll_still_flags_in_guardian(self):
+        # enforcement makes an organic breach impossible, so a breach
+        # means tampering: the Guardian must still detect it
+        self._fill_with_four_max_bets()
+        self.rt.db.kv_set("bankroll", "7500.00")
+        findings = self.rt.guardian.full_scan()
+        self.assertTrue(any("exposure" in f.lower()
+                            for f in findings))
+
+
+class TestResultSetSeparation(NovyraCase):
+    """Phase 0 / audit E3: results the Owner supplied ('settle'
+    command) are reported separately from the model's own simulated
+    results, and headline win-rate evidence counts only
+    owner-settled bets."""
+
+    def _mixed_ledger(self):
+        rt = make_runtime()
+        rt.activate_department("Betting Department")
+        book = rt.book
+        a = book.place("A vs B", "home win", 2.5, 0.45, 50.0)
+        b = book.place("C vs D", "draw", 3.4, 0.30, 40.0)
+        c = book.place("E vs F", "away win", 3.0, 0.25, 30.0)
+        d = book.place("G vs H", "home win", 2.2, 0.50, 20.0)
+        book.settle(a, "home win", "owner", actor="Owner")   # +75.00
+        book.settle(c, "draw", "owner", actor="Owner")       # -30.00
+        book.settle(b, "draw", "simulated")                 # +96.00
+        book.settle(d, "home win", "simulated")             # +24.00
+        # owner-settled: 2 bets, 1 won, PnL +45.00
+        # model-settled: 2 bets, PnL +120.00
+        return rt
+
+    def test_pnl_helpers_split_by_result_source(self):
+        rt = self._mixed_ledger()
+        book = rt.book
+        self.assertAlmostEqual(book.realized_pnl(), 165.0)
+        self.assertAlmostEqual(book.realized_pnl("owner"), 45.0)
+        self.assertAlmostEqual(book.realized_pnl("simulated"), 120.0)
+        self.assertEqual(len(book.settled_rows("owner")), 2)
+        self.assertEqual(len(book.settled_rows("simulated")), 2)
+        self.assertEqual(len(book.settled_rows()), 4)
+
+    def test_bets_command_separates_the_sources(self):
+        rt = self._mixed_ledger()
+        cli = N.CLI(rt)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.dispatch("bets")
+        out = buf.getvalue()
+        # every settled row is tagged with its result source
+        self.assertIn("[owner]", out)
+        self.assertIn("[model]", out)
+        self.assertIn("Owner-settled: 2 bet(s), 1 won, win rate "
+                      "50.0%, PnL +45.00.", out)
+        # the model line is present, labelled, and wraps safely
+        self.assertIn("Model-settled (synthetic results, not "
+                      "evidence of edge): 2 bet(s),", out)
+        self.assertIn("+120.00.", out)
+
+    def test_bets_command_has_no_model_line_when_all_owner_settled(self):
+        rt = make_runtime()
+        bet = rt.book.place("A vs B", "home win", 2.5, 0.45, 50.0)
+        rt.book.settle(bet, "home win", "owner", actor="Owner")
+        cli = N.CLI(rt)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.dispatch("bets")
+        out = buf.getvalue()
+        self.assertIn("Owner-settled: 1 bet(s), 1 won, win rate "
+                      "100.0%, PnL +75.00.", out)
+        self.assertNotIn("Model-settled", out)
+
+    def test_manager_report_headline_uses_owner_results_only(self):
+        rt = self._mixed_ledger()
+        mgr = rt.manager_of("Betting Department")
+        text = mgr.report()
+        # the naive win rate over all settled bets would be 3/4 =
+        # 75.0%; the headline must stay at the owner-settled 50.0%
+        self.assertIn("Owner-settled: 2 bet(s), win rate 50.0%, "
+                      "PnL +45.00 (the only performance evidence)",
+                      text)
+        self.assertIn("Model-settled (synthetic results, not "
+                      "evidence of edge): 2 bet(s), PnL +120.00",
+                      text)
+        self.assertIn("(owner-settled +45.00, model-settled "
+                      "+120.00)", text)
+        self.assertNotIn("75.0%", text)
 
 
 if __name__ == "__main__":
