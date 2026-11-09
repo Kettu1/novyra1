@@ -1,9 +1,46 @@
 #!/usr/bin/env python3
-"""Novyra 0.2.2: a multi-agent company operating system for your terminal.
+"""Novyra 0.3.0-dev: a multi-agent company operating system for your terminal.
+
+Develop branch (develop/0.3.0), Phase 0: the three high-priority
+fixes from the 0.2.2 audit. The main branch stays on 0.2.2.
 
 The Owner (you) sits at the top. The CEO Agent coordinates a 57-entry
 blueprint (48 agents + 9 shared systems) across six departments: core
 management, Betting, Ecommerce, Marketing, Trading and Finance.
+
+Changelog 0.3.0-dev (Phase 0, from 0.2.2)
+-----------------------------------------
+* Demo isolation (audit E1/F-01): the 'demo' command no longer runs
+  the scripted showcase on the live session. It spins up its own
+  throwaway in-memory Runtime(demo=True) with auto-granted approvals,
+  runs the script there and closes it, so the live bankroll, bets,
+  roster, autonomy flag and approval history are never touched by
+  demo activity. This finally matches the help text, which always
+  promised a "throwaway database".
+* Aggregate exposure limit (audit E2/F-02): placement now enforces a
+  total cap on open exposure, MAX_TOTAL_EXPOSURE_FRACTION = 10% of
+  the bankroll (same rule the Guardian scanned for, now enforced
+  transactionally at placement time). The check uses the
+  post-placement state (open exposure including this stake over the
+  bankroll after this stake's deduction), so the Guardian's 10%
+  scan can never flag a bet the book accepted. With the 2% per-bet
+  cap this means at most five maximum-size positions at once. A
+  refused placement is audited like every other refusal. Because
+  settled losses never reduce the bankroll further (stakes are
+  already deducted) and wins only add to it, an organic breach of
+  the limit is now impossible; the Guardian check remains in place
+  as a tamper detector.
+* Owner-settled vs model-settled reporting (audit E3/F-03): bets
+  settled by the Owner ('settle' command, result_source "owner")
+  are reported separately from bets settled by the model's own
+  simulated results (Post-Match Review, result_source "simulated").
+  Win rate and headline PnL evidence now come from owner-settled
+  bets only; model-settled results are shown in their own clearly
+  labelled line ("synthetic results, not evidence of edge").
+  BettingBook.realized_pnl() and settled_rows() accept an optional
+  result_source filter; the 'bets' command tags every settled row
+  with [owner] or [model]; the Betting Manager report and the CEO
+  daily report show the split.
 
 Changelog 0.2.2 (from 0.2.1)
 ----------------------------
@@ -122,7 +159,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
-VERSION = "0.2.2"
+VERSION = "0.3.0-dev"
 
 
 # ---------------------------------------------------------------- utilities
@@ -605,6 +642,9 @@ class Database:
 OUTCOMES = ("home win", "draw", "away win")
 MIN_STAKE = 1.0
 MAX_STAKE_FRACTION = 0.02
+# aggregate cap on total open exposure, enforced transactionally at
+# placement time (audit E2). The Guardian scans for the same rule.
+MAX_TOTAL_EXPOSURE_FRACTION = 0.10
 INITIAL_BANKROLL = 10000.0
 
 
@@ -661,6 +701,10 @@ class BettingBook:
     conversion, never binary floats), so the ledger invariant
     (bankroll = initial + realised PnL - open exposure) holds to the
     cent and a stake that displays as exactly the cap is accepted.
+    Total open exposure is also capped at
+    MAX_TOTAL_EXPOSURE_FRACTION of the bankroll, checked in the same
+    transaction against the post-placement state, so a legal
+    placement can never trip the Guardian's exposure scan.
     Every placement and settlement attempt, successful or refused,
     is recorded in the Guardian's actions table.
     """
@@ -721,6 +765,25 @@ class BettingBook:
                     raise BettingError(
                         "insufficient bankroll: %.2f available"
                         % from_cents(bankroll_cents))
+                # aggregate exposure cap (audit E2): total open
+                # exposure including this stake, measured against the
+                # bankroll after this stake's deduction (the exact
+                # state the Guardian will scan afterwards), truncated
+                # to whole cents like every other money limit
+                open_cents = sum(to_cents(r["stake"])
+                                 for r in self.db.bets_open())
+                exposure_cents = open_cents + stake_cents
+                max_exposure_cents = int(
+                    Decimal(str(MAX_TOTAL_EXPOSURE_FRACTION))
+                    * (bankroll_cents - stake_cents))
+                if exposure_cents > max_exposure_cents:
+                    raise BettingError(
+                        "aggregate exposure %.2f plus this stake "
+                        "exceeds the %.2f total exposure cap "
+                        "(%.0f%% of bankroll)"
+                        % (from_cents(open_cents),
+                           from_cents(max_exposure_cents),
+                           MAX_TOTAL_EXPOSURE_FRACTION * 100))
                 self.db.kv_set(
                     "bankroll",
                     "%.2f" % from_cents(bankroll_cents - stake_cents),
@@ -790,11 +853,20 @@ class BettingBook:
                               from_cents(pnl_cents)), 1)
         return won, from_cents(pnl_cents)
 
-    def settled_rows(self):
-        return [r for r in self.db.bets_all() if r["status"] != "open"]
+    def settled_rows(self, result_source=None):
+        """Settled bets, optionally filtered by who supplied the
+        result: "owner" (the real Owner via the settle command) or
+        anything else (the model's own simulated results)."""
+        rows = [r for r in self.db.bets_all()
+                if r["status"] != "open"]
+        if result_source is not None:
+            rows = [r for r in rows
+                    if r["result_source"] == result_source]
+        return rows
 
-    def realized_pnl(self):
-        return sum((r["pnl"] or 0.0) for r in self.settled_rows())
+    def realized_pnl(self, result_source=None):
+        return sum((r["pnl"] or 0.0)
+                   for r in self.settled_rows(result_source))
 
     def open_exposure(self):
         return sum(r["stake"] for r in self.open_bets())
@@ -925,8 +997,7 @@ class Permissions:
 
     Every sensitive action goes through request(), which records an
     approval or denial row. The emergency stop is persisted, so a
-    restart does not silently re-enable halted agents, and resume also
-    requires Owner approval.
+    restart does not silently re-enable halted agents, and resume also    requires Owner approval.
     """
 
     def __init__(self, runtime):
@@ -1364,8 +1435,12 @@ class CEOAgent(Agent):
         if rt.dept_active("Betting Department"):
             book = rt.book
             L.append("Betting (simulation): bankroll %s, realised PnL "
-                     "%+.2f, %d open positions, exposure %s"
+                     "%+.2f (owner-settled %+.2f, model-settled "
+                     "%+.2f), %d open positions, exposure %s"
                      % (money(book.bankroll), book.realized_pnl(),
+                        book.realized_pnl("owner"),
+                        book.realized_pnl()
+                        - book.realized_pnl("owner"),
                         len(book.open_bets()), money(book.open_exposure())))
         issues = rt.guardian.monitor()
         if issues:
@@ -1464,10 +1539,13 @@ class GuardianAgent(Agent):
         open_bets = book.open_bets()
         if open_bets and book.bankroll > 0:
             ratio = book.open_exposure() / book.bankroll
-            if ratio > 0.10:
+            if ratio > MAX_TOTAL_EXPOSURE_FRACTION:
                 findings.append("RISK: open exposure is %.1f%% of the "
-                                "bankroll (limit 10%%)."
-                                % (ratio * 100))
+                                "bankroll (limit %s). Since placement "
+                                "enforces this cap, a breach means "
+                                "tampering or a legacy database."
+                                % (ratio * 100,
+                                   pct(MAX_TOTAL_EXPOSURE_FRACTION)))
         approvals = db.approvals_count()
         denied = rt.permissions.denied_actions
         if approvals >= 4 and denied * 2 > approvals:
@@ -1674,9 +1752,11 @@ class BettingRiskManager(BettingWorker):
         ctx["stake"] = stake
         exposure = book.open_exposure() + stake
         return ("Risk view: Kelly %.2f%%, capped at 2%%. Approved stake %s "
-                "(%.1f%% of bankroll). Exposure after placement: %.1f%%."
+                "(%.1f%% of bankroll). Exposure after placement: %.1f%% "
+                "(aggregate limit %s)."
                 % (frac * 100, money(stake), stake / bankroll * 100,
-                   exposure / bankroll * 100))
+                   exposure / bankroll * 100,
+                   pct(MAX_TOTAL_EXPOSURE_FRACTION)))
 
 
 class BettingPortfolioManager(BettingWorker):
@@ -1829,20 +1909,39 @@ class BettingManager(ManagerAgent):
         rows = rt.db.bets_all()
         settled = [r for r in rows if r["status"] != "open"]
         open_bets = [r for r in rows if r["status"] == "open"]
-        wins = sum(1 for r in settled if (r["pnl"] or 0) > 0)
+        # audit E3: results supplied by the Owner are the only real
+        # performance evidence; the model's own simulated results
+        # are reported separately and never blended into the win rate
+        owner = [r for r in settled if r["result_source"] == "owner"]
+        model = [r for r in settled if r["result_source"] != "owner"]
+        owner_wins = sum(1 for r in owner if (r["pnl"] or 0) > 0)
+        model_pnl = sum((r["pnl"] or 0.0) for r in model)
         lines = ["Betting Manager operational report:"]
         lines.append("  - Mode: simulation, synthetic data only")
         lines.append("  - Bankroll: %s (initial %s)"
                      % (money(book.bankroll), money(book.initial_bankroll)))
-        lines.append("  - Realised PnL: %+.2f" % book.realized_pnl())
+        lines.append("  - Realised PnL: %+.2f total (owner-settled "
+                     "%+.2f, model-settled %+.2f)"
+                     % (book.realized_pnl(), book.realized_pnl("owner"),
+                        model_pnl))
         lines.append("  - Open positions: %d" % len(open_bets))
         for p in open_bets:
             lines.append("      * #%d %s, %s @ %.2f, stake %s"
                          % (p["id"], p["match_name"], p["outcome"],
                             p["odds"], money(p["stake"])))
-        if settled:
-            lines.append("  - Settled bets: %d, win rate %s"
-                         % (len(settled), pct(wins / float(len(settled)))))
+        if owner:
+            lines.append("  - Owner-settled: %d bet(s), win rate %s, "
+                         "PnL %+.2f (the only performance evidence)"
+                         % (len(owner),
+                            pct(owner_wins / float(len(owner))),
+                            book.realized_pnl("owner")))
+        else:
+            lines.append("  - Owner-settled: none yet. Win rate and "
+                         "edge claims need Owner-verified results.")
+        if model:
+            lines.append("  - Model-settled (synthetic results, not "
+                         "evidence of edge): %d bet(s), PnL %+.2f"
+                         % (len(model), model_pnl))
         lines.append("  - Recommendation: %s"
                      % random.choice(["keep stakes at the 2% cap",
                                       "pause draw bets until calibration "
@@ -1897,8 +1996,7 @@ SPECIAL_CLASSES = {
     ("Betting Department", "Data Quality"): DataQuality,
     ("Betting Department", "Market Intelligence"): MarketIntelligence,
     ("Betting Department", "Opportunity Scanner"): OpportunityScanner,
-    ("Betting Department", "Prediction Engine"): PredictionEngine,
-    ("Betting Department", "Value Finder"): ValueFinder,
+    ("Betting Department", "Prediction Engine"): PredictionEngine,    ("Betting Department", "Value Finder"): ValueFinder,
     ("Betting Department", "Confidence"): Confidence,
     ("Betting Department", "Risk Manager"): BettingRiskManager,
     ("Betting Department", "Portfolio Manager"): BettingPortfolioManager,
@@ -2532,16 +2630,38 @@ class CLI:
             return
         for r in rows:
             pnl = ("%+.2f" % r["pnl"]) if r["pnl"] is not None else ""
-            print("  #%-3d %-26s %-9s stake %8s @ %.2f  %-8s %s"
+            # audit E3: every settled row carries its result source
+            tag = ""
+            if r["status"] != "open":
+                tag = " [owner]" if r["result_source"] == "owner" \
+                    else " [model]"
+            print("  #%-3d %-26s %-9s stake %8s @ %.2f  %-8s %s%s"
                   % (r["id"], r["match_name"][:26], r["outcome"],
-                     money(r["stake"]), r["odds"], r["status"], pnl))
+                     money(r["stake"]), r["odds"], r["status"], pnl, tag))
         settled = [r for r in rows if r["status"] != "open"]
         open_bets = [r for r in rows if r["status"] == "open"]
-        wins = sum(1 for r in settled if (r["pnl"] or 0) > 0)
-        print(wrap("Bankroll %s, realised PnL %+.2f, %d settled (%d won), "
-                   "%d open."
+        # audit E3: owner-settled and model-settled results are
+        # summarised separately; the win rate counts only results the
+        # Owner actually supplied
+        owner = [r for r in settled if r["result_source"] == "owner"]
+        model = [r for r in settled if r["result_source"] != "owner"]
+        owner_wins = sum(1 for r in owner if (r["pnl"] or 0) > 0)
+        model_pnl = sum((r["pnl"] or 0.0) for r in model)
+        print(wrap("Owner-settled: %d bet(s), %d won, win rate %s, "
+                   "PnL %+.2f."
+                   % (len(owner), owner_wins,
+                      pct(owner_wins / float(len(owner))) if owner
+                      else "n/a",
+                      rt.book.realized_pnl("owner"))))
+        if model:
+            print(wrap("Model-settled (synthetic results, not evidence "
+                       "of edge): %d bet(s), PnL %+.2f."
+                       % (len(model), model_pnl)))
+        print(wrap("Bankroll %s, realised PnL %+.2f total, %d open "
+                   "(exposure %s)."
                    % (money(rt.book.bankroll), rt.book.realized_pnl(),
-                      len(settled), wins, len(open_bets))))
+                      len(open_bets),
+                      money(rt.book.open_exposure()))))
 
     def cmd_settle(self, rest):
         rt = self.rt
@@ -2796,7 +2916,25 @@ class CLI:
             print(wrap("Declined. Emergency stop stays engaged."))
 
     def cmd_demo(self, rest):
-        self.run_demo()
+        """Audit E1: the demo must never touch the live session.
+
+        The scripted showcase runs on its own throwaway in-memory
+        Runtime(demo=True), whose approvals are auto-granted and
+        whose database is discarded on close. The live bankroll,
+        bets, roster, autonomy flag, approvals and audit log are
+        untouched by anything the script does. If the demo itself
+        crashes, the throwaway runtime is still closed cleanly.
+        """
+        demo_rt = Runtime(demo=True)
+        demo_cli = CLI(demo_rt)
+        try:
+            demo_cli.run_demo()
+        finally:
+            demo_rt.close()
+        print(wrap("[CEO] Demo finished on a throwaway database. "
+                   "Your live session is untouched: bankroll, bets, "
+                   "roster, autonomy and approvals are exactly as "
+                   "you left them.", "  " + C.DIM))
 
     def cmd_exit(self, rest):
         print(wrap("[CEO] Logging off. All state is saved to the database. "
@@ -2858,92 +2996,3 @@ class CLI:
     def banner(self):
         print(C.BOLD + C.MAGENTA + r"""
     _   _                 ______
-    | \ | | _____   ____ _/ ____| __ _ _   _   _  __
-    |  \| |/ _ \ \ / / _` \___ \ / _` | | | \ \ / / /
-    | |\  | (_) \ V / (_| |___) | (_| | |_| |\ V / /
-    |_| \_|\___/ \_/ \__,_|____/ \__,_|\__, | \_/ /
-                                        |___/     /_/  v%s
-""" % VERSION + C.RESET)
-        print(wrap("A multi-agent company operating system. You are the "
-                   "Owner. The CEO Agent coordinates %d blueprint entries "
-                   "across 6 departments plus shared systems."
-                   % self.rt.blueprint_size()))
-        print(wrap("Type 'help' for commands, 'demo' for a guided tour, or "
-                   "just talk to the CEO."))
-        print(wrap("Mode: simulation with synthetic data. No real money "
-                   "moves and no external betting services are called.",
-                   "  " + C.DIM))
-        print(wrap("Autonomous simulated betting: %s."
-                   % ("ENABLED (scans act on their own)"
-                      if self.rt.sim_autonomy
-                      else "disabled (each simulated bet needs your "
-                           "approval)"),
-                   "  " + C.DIM))
-        if self.rt.demo:
-            print(wrap("DEMO MODE: approvals are auto-granted and the "
-                       "database is a throwaway in-memory copy. Nothing "
-                       "you do here is saved.", "  " + C.RED))
-        if self.rt.permissions.emergency_stop:
-            print(wrap("EMERGENCY STOP IS ENGAGED from a previous "
-                       "session. All agents are halted until you run "
-                       "'resume' with approval.", "  " + C.RED))
-
-    def repl(self):
-        self.banner()
-        while True:
-            try:
-                line = input("%snovyra>%s " % (C.BOLD + C.GREEN,
-                                              C.RESET)).strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                self.cmd_exit("")
-            if not line:
-                continue
-            self.dispatch(line)
-
-    def run_demo(self):
-        self.banner()
-        script = [
-            "status",
-            "agents",
-            "activate Betting Department",
-            "autonomy on",
-            "scan",
-            "scan",
-            "bets",
-            "report",
-            "meeting Betting Department",
-            "do Data Collector review this week's fixtures",
-            "propose Ecommerce Manager",
-            "guardian",
-            "messages",
-            "log 20",
-        ]
-        for cmd in script:
-            print("\n%s%snovyra> %s%s" % (C.DIM, C.BOLD, cmd, C.RESET))
-            self.dispatch(cmd)
-        print(wrap("[CEO] That concludes the demo. In interactive mode you "
-                   "approve actions yourself, and everything persists to "
-                   "the database. Type 'help' for everything.",
-                   "  " + C.DIM))
-
-
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    C.off()
-    demo = "--demo" in argv
-    rt = Runtime(demo=demo)
-    cli = CLI(rt)
-    try:
-        if demo:
-            cli.run_demo()
-        else:
-            cli.repl()
-    except SystemExit:
-        pass
-    finally:
-        rt.close()
-
-
-if __name__ == "__main__":
-    main()
