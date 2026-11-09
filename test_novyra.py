@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""Automated test suite for Novyra 0.2.1.
+"""Automated test suite for Novyra 0.2.2.
 
 Place this file next to novyra.py, then run:
 
     python3 test_novyra.py
 
 Covers: betting maths, the betting book (stake deduction, cent
-rounding, settlement, validation, atomicity and double-settlement
-protection), database persistence, permissions, the emergency stop,
-blocked-action counting, restart round-trips, the betting pipeline
-invariant, autonomous-mode gating, persistent communication history,
-Guardian integrity scans and the watchdog, agent action execution
-via the LLM planner (including refusal of unsafe actions), agent
+rounding, exact stake-limit boundaries, settlement, validation,
+atomicity and double-settlement protection), database persistence,
+permissions, the emergency stop, blocked-action counting, restart
+round-trips, the betting pipeline invariant, autonomous-mode gating,
+persistent communication history, Guardian integrity scans and the
+watchdog, agent action execution via the LLM planner (including
+refusal of unsafe actions), complete auditing of sensitive actions
+in the actions table, reliable database connection cleanup, agent
 roster uniqueness, LLM fallback behaviour, and CLI input validation.
 No network access or LLM endpoint is required.
+
+Every runtime and database opened by a test is closed in teardown,
+so the suite leaves no dangling SQLite connections and produces no
+resource warnings. Run it with warnings as errors to verify:
+
+    python3 -W error::ResourceWarning test_novyra.py
 """
 
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -26,14 +35,41 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import novyra as N
 
 
+# runtimes opened by the test currently running; the shared base
+# class closes them all in teardown
+_OPEN_RUNTIMES = []
+
+
 def make_runtime(db_path=":memory:"):
-    """Runtime with all Owner approvals auto-granted for testing."""
+    """Runtime with all Owner approvals auto-granted for testing.
+    Every runtime created here is closed automatically in teardown."""
     rt = N.Runtime(db_path=db_path, demo=False)
     rt.ask_owner = lambda question: True
+    _OPEN_RUNTIMES.append(rt)
     return rt
 
 
-class TestMath(unittest.TestCase):
+class NovyraCase(unittest.TestCase):
+    """Shared teardown: closes every Runtime (and the bare Database on
+    self.db) the test opened, so no SQLite connection outlives its
+    test and no resource warnings remain."""
+
+    def tearDown(self):
+        while _OPEN_RUNTIMES:
+            rt = _OPEN_RUNTIMES.pop()
+            try:
+                rt.close()
+            except Exception:
+                pass
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+class TestMath(NovyraCase):
     def test_poisson_probs_normalized(self):
         p = N.match_probs(1.5, 1.1)
         self.assertAlmostEqual(sum(p), 1.0)
@@ -55,7 +91,7 @@ class TestMath(unittest.TestCase):
         self.assertEqual(N.slug("  CEO  Agent "), "ceo-agent")
 
 
-class TestDatabase(unittest.TestCase):
+class TestDatabase(NovyraCase):
     def setUp(self):
         self.db = N.Database(":memory:")
 
@@ -94,7 +130,7 @@ class TestDatabase(unittest.TestCase):
             self.db.wipe_table("secrets")
 
 
-class TestBettingBook(unittest.TestCase):
+class TestBettingBook(NovyraCase):
     def setUp(self):
         self.rt = make_runtime()
         self.book = self.rt.book
@@ -162,7 +198,7 @@ class TestBettingBook(unittest.TestCase):
             self.book.place("A vs B", "home win", 2.5, 0.45, 1.0)  # cap 0.80
 
 
-class TestPermissions(unittest.TestCase):
+class TestPermissions(NovyraCase):
     def test_denied_activation_records_denial(self):
         rt = make_runtime()
         rt.ask_owner = lambda question: False
@@ -184,8 +220,10 @@ class TestPermissions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "t.db")
             rt = N.Runtime(db_path=path, demo=False)
+            self.addCleanup(rt.close)
             rt.permissions.halt()
             rt2 = N.Runtime(db_path=path, demo=False)
+            self.addCleanup(rt2.close)
             self.assertTrue(rt2.permissions.emergency_stop)
 
     def test_approved_activation_persists_approval(self):
@@ -195,7 +233,7 @@ class TestPermissions(unittest.TestCase):
         self.assertEqual(rt.db.approvals_count(), 1)
 
 
-class TestPersistence(unittest.TestCase):
+class TestPersistence(NovyraCase):
     def test_full_restart_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "novyra.db")
@@ -207,6 +245,7 @@ class TestPersistence(unittest.TestCase):
             bank = rt.book.bankroll
 
             rt2 = N.Runtime(db_path=path, demo=False)
+            self.addCleanup(rt2.close)
             self.assertTrue(rt2.dept_active("Betting Department"))
             self.assertEqual(len(rt2.book.open_bets()), 1)
             self.assertAlmostEqual(rt2.book.bankroll, bank)
@@ -228,7 +267,7 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(rt.db.tasks_all(), [])
 
 
-class TestPipeline(unittest.TestCase):
+class TestPipeline(NovyraCase):
     def test_scan_runs_and_ledger_stays_consistent(self):
         rt = make_runtime()
         rt.set_autonomy(True)  # full autonomous pipeline for this test
@@ -260,7 +299,7 @@ class TestPipeline(unittest.TestCase):
         self.assertTrue(mgr.is_manager)
 
 
-class TestRosterAndBus(unittest.TestCase):
+class TestRosterAndBus(NovyraCase):
     def test_unique_ids_for_duplicate_names(self):
         rt = make_runtime()
         a = rt.instantiate("Advertising", "Ecommerce Department",
@@ -278,7 +317,7 @@ class TestRosterAndBus(unittest.TestCase):
                             for r in rows))
 
 
-class TestLLMIntegration(unittest.TestCase):
+class TestLLMIntegration(NovyraCase):
     def test_unconfigured_client_returns_none(self):
         client = N.LLMClient()
         if client.configured:
@@ -317,7 +356,7 @@ class TestLLMIntegration(unittest.TestCase):
         self.assertEqual(rt.db.log_count(level="warn") >= 1, True)
 
 
-class TestCLIValidation(unittest.TestCase):
+class TestCLIValidation(NovyraCase):
     def test_bad_commands_do_not_crash(self):
         rt = make_runtime()
         cli = N.CLI(rt)
@@ -354,7 +393,7 @@ class TestCLIValidation(unittest.TestCase):
         self.assertEqual(len(rt.db.tasks_all()), 1)
 
 
-class TestAtomicity(unittest.TestCase):
+class TestAtomicity(NovyraCase):
     """Bet placement and settlement must be all-or-nothing."""
 
     def test_failed_bet_insert_rolls_back_bankroll(self):
@@ -417,7 +456,7 @@ class TestAtomicity(unittest.TestCase):
         self.assertAlmostEqual(book.bankroll, expected, places=2)
 
 
-class TestAutonomy(unittest.TestCase):
+class TestAutonomy(NovyraCase):
     """Autonomous simulated money movements stay disabled unless the
     Owner explicitly authorises them."""
 
@@ -483,7 +522,7 @@ class TestAutonomy(unittest.TestCase):
         self.assertFalse(rt.sim_autonomy)
 
 
-class TestMessagePersistence(unittest.TestCase):
+class TestMessagePersistence(NovyraCase):
     def test_messages_survive_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "novyra.db")
@@ -493,6 +532,7 @@ class TestMessagePersistence(unittest.TestCase):
             rt.bus.send("Guardian Agent", "CEO Agent", "patrol report",
                         "nothing to flag")
             rt2 = N.Runtime(db_path=path, demo=False)
+            self.addCleanup(rt2.close)
             rows = rt2.db.messages_tail(10)
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[0]["subject"], "weekly summary")
@@ -515,10 +555,16 @@ class TestMessagePersistence(unittest.TestCase):
         self.assertEqual(rt.db.actions_count(), 1)
         rt.reset_data()
         self.assertEqual(rt.db.messages_count(), 0)
-        self.assertEqual(rt.db.actions_count(), 0)
+        # the wipe clears the watch; exactly one watched action
+        # remains, the reset itself
+        self.assertEqual(rt.db.actions_count(), 1)
+        row = rt.db.conn.execute(
+            "SELECT action FROM actions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(row["action"], "reset data")
 
 
-class TestGuardian(unittest.TestCase):
+class TestGuardian(NovyraCase):
     def test_full_scan_clean_system(self):
         rt = make_runtime()
         self.assertEqual(rt.guardian.full_scan(), [])
@@ -580,7 +626,7 @@ class TestGuardian(unittest.TestCase):
         self.assertEqual(rt.guardian.full_scan(), [])
 
 
-class TestAgentActions(unittest.TestCase):
+class TestAgentActions(NovyraCase):
     """Agents execute whitelisted actions; unsafe plans are refused."""
 
     def _llm_runtime(self, reply):
@@ -658,6 +704,201 @@ class TestAgentActions(unittest.TestCase):
         cli.dispatch("do Developer Agent anything")
         self.assertEqual(calls, [])  # the LLM was never even consulted
         self.assertEqual(rt.db.tasks_all(), [])
+
+
+class TestStakeLimits(NovyraCase):
+    """Stake limits are enforced in integer cents: a stake that
+    displays as exactly the cap is accepted, one cent below too,
+    one cent above is rejected, and the cap never rounds up."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.book = self.rt.book
+
+    def test_stake_exactly_at_cap_is_accepted(self):
+        # bankroll 100.00 -> cap exactly 2.00
+        self.rt.db.kv_set("bankroll", "100.00")
+        self.book.place("A vs B", "home win", 2.5, 0.45, 2.0)
+        self.assertAlmostEqual(self.book.bankroll, 98.00)
+        self.assertEqual(len(self.book.open_bets()), 1)
+
+    def test_stake_one_cent_below_cap_is_accepted(self):
+        self.rt.db.kv_set("bankroll", "100.00")
+        self.book.place("A vs B", "home win", 2.5, 0.45, 1.99)
+        self.assertAlmostEqual(self.book.bankroll, 98.01)
+
+    def test_stake_one_cent_above_cap_is_rejected(self):
+        self.rt.db.kv_set("bankroll", "100.00")
+        with self.assertRaises(N.BettingError) as cm:
+            self.book.place("A vs B", "home win", 2.5, 0.45, 2.01)
+        self.assertIn("cap", str(cm.exception))
+        # nothing was placed or deducted
+        self.assertAlmostEqual(self.book.bankroll, 100.00)
+        self.assertEqual(self.book.open_bets(), [])
+
+    def test_cap_boundary_at_default_bankroll(self):
+        # default bankroll 10000.00 -> cap exactly 200.00
+        self.book.place("A vs B", "home win", 2.5, 0.45, 200.0)
+        self.assertAlmostEqual(self.book.bankroll, 9800.00)
+        with self.assertRaises(N.BettingError):
+            self.book.place("C vs D", "draw", 3.4, 0.30, 200.01)
+
+    def test_cap_with_fractional_cents_truncates_never_rounds_up(self):
+        # bankroll 100.35 -> raw cap 2.007; the fraction must truncate
+        # to 2.00 (old float code could round the cap up to a
+        # rejectable 2.01 and then refuse a stake that displayed as
+        # exactly the cap)
+        self.rt.db.kv_set("bankroll", "100.35")
+        self.book.place("A vs B", "home win", 2.5, 0.45, 2.0)
+        self.assertAlmostEqual(self.book.bankroll, 98.35)
+        with self.assertRaises(N.BettingError):
+            self.book.place("C vs D", "draw", 3.4, 0.30, 2.01)
+
+    def test_risk_manager_never_proposes_above_the_cap(self):
+        rt = self.rt
+        rt.activate_department("Betting Department")
+        rt.db.kv_set("bankroll", "100.35")
+        risk = rt.find("risk-manager")
+        ctx = {"fixture": {"home": "Helsinki", "away": "Turku"},
+               "pick": ("home win", 0.90, 8.0), "run": 1}
+        reply = risk.step(ctx)
+        self.assertIn("stake", ctx)
+        self.assertLessEqual(ctx["stake"], 2.0)  # floored, not rounded up
+        self.assertIn("Approved stake", reply)
+        # and the proposed stake is actually placeable at this bankroll
+        self.book.place("Helsinki vs Turku", "home win", 8.0, 0.90,
+                        ctx["stake"])
+
+
+class TestResourceCleanup(NovyraCase):
+    """A Runtime owns exactly one SQLite connection; close() must
+    release it, be idempotent, work as a context manager, and the
+    shutdown must be audited and durable."""
+
+    def test_close_releases_the_connection(self):
+        rt = make_runtime()
+        rt.db.kv_set("x", "1")
+        rt.close()
+        self.assertTrue(rt.db.closed)
+        self.assertTrue(rt._closed)
+        with self.assertRaises(sqlite3.Error):
+            rt.db.kv_get("x")  # the connection is really gone
+
+    def test_close_is_idempotent(self):
+        rt = make_runtime()
+        rt.close()
+        rt.close()  # second close must be a harmless no-op
+
+    def test_runtime_context_manager_closes_database(self):
+        with make_runtime() as rt:
+            rt.db.kv_set("x", "1")
+        self.assertTrue(rt.db.closed)
+
+    def test_database_context_manager_closes(self):
+        with N.Database(":memory:") as db:
+            db.kv_set("x", "1")
+        self.assertTrue(db.closed)
+
+    def test_bad_database_path_fails_without_leaking(self):
+        with self.assertRaises(N.NovyraError):
+            N.Database("/no/such/dir/novyra.db")
+
+    def test_shutdown_is_audited_and_data_survives_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.db")
+            rt = make_runtime(path)
+            rt.book.place("A vs B", "home win", 2.5, 0.45, 10.0)
+            bank = rt.book.bankroll
+            rt.close()
+            rt2 = N.Runtime(db_path=path, demo=False)
+            self.addCleanup(rt2.close)
+            rows = rt2.db.log_tail(5)
+            self.assertTrue(any(r["event"] == "shutdown"
+                                for r in rows))
+            # closing must never lose data: the ledger is intact
+            self.assertAlmostEqual(rt2.book.bankroll, bank)
+            self.assertEqual(len(rt2.book.open_bets()), 1)
+
+
+class TestAuditLogging(NovyraCase):
+    """Approvals, denials, blocked actions, refused money operations
+    and other sensitive operations must all reach the actions table
+    with their outcome, so the Guardian watches the whole permission
+    and approval system."""
+
+    def _last_action(self, rt):
+        return rt.db.conn.execute(
+            "SELECT actor, action, detail, allowed FROM actions "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+
+    def test_approval_and_denial_are_recorded(self):
+        rt = make_runtime()
+        rt.activate_department("Betting Department")  # approved
+        self.assertEqual(rt.db.actions_count(allowed=True), 1)
+        rt.ask_owner = lambda question: False
+        rt.activate_department("Ecommerce Department")  # denied
+        self.assertEqual(rt.db.actions_count(allowed=False), 1)
+        row = self._last_action(rt)
+        self.assertEqual(row["actor"], "Owner")
+        self.assertEqual(row["action"], "activate department")
+
+    def test_blocked_action_during_stop_is_recorded(self):
+        rt = make_runtime()
+        rt.permissions.halt()
+        self.assertFalse(rt.permissions.guard("run betting scan",
+                                             "Betting Manager"))
+        self.assertEqual(rt.db.actions_count(allowed=False), 1)
+        row = self._last_action(rt)
+        self.assertEqual(row["actor"], "Betting Manager")
+        self.assertIn("scan", row["action"])
+        self.assertIn("blocked", row["detail"])
+
+    def test_over_cap_placement_is_recorded_as_refused(self):
+        rt = make_runtime()
+        with self.assertRaises(N.BettingError):
+            rt.book.place("A vs B", "home win", 2.5, 0.45, 500.0,
+                          actor="Portfolio Manager")
+        self.assertEqual(rt.db.actions_count(allowed=False), 1)
+        row = self._last_action(rt)
+        self.assertEqual(row["actor"], "Portfolio Manager")
+        self.assertEqual(row["action"], "place bet")
+        self.assertIn("refused", row["detail"])
+
+    def test_double_settlement_is_recorded_as_refused(self):
+        rt = make_runtime()
+        bet_id = rt.book.place("A vs B", "home win", 2.5, 0.45, 50.0)
+        self.assertEqual(rt.db.actions_count(allowed=False), 0)
+        rt.book.settle(bet_id, "home win", "owner", actor="Owner")
+        with self.assertRaises(N.BettingError):
+            rt.book.settle(bet_id, "draw", "owner", actor="Owner")
+        self.assertEqual(rt.db.actions_count(allowed=False), 1)
+        self.assertEqual(rt.db.actions_count(allowed=True), 2)
+        row = self._last_action(rt)
+        self.assertIn("refused", row["detail"])
+
+    def test_stop_resume_and_autonomy_changes_are_recorded(self):
+        rt = make_runtime()
+        rt.permissions.halt()
+        rt.permissions.do_resume()
+        rt.set_autonomy(True)
+        rt.set_autonomy(False)
+        rows = [(r["actor"], r["action"], r["allowed"])
+                for r in rt.db.conn.execute(
+                    "SELECT actor, action, allowed FROM actions "
+                    "ORDER BY id").fetchall()]
+        self.assertIn(("Owner", "emergency stop", 1), rows)
+        self.assertIn(("Owner", "resume", 1), rows)
+        self.assertIn(("Owner", "autonomy on", 1), rows)
+        self.assertIn(("Owner", "autonomy off", 1), rows)
+
+    def test_reset_is_recorded_after_the_wipe(self):
+        rt = make_runtime()
+        rt.book.place("A vs B", "home win", 2.5, 0.45, 50.0)
+        rt.reset_data()
+        self.assertEqual(rt.db.actions_count(), 1)  # only the reset
+        row = self._last_action(rt)
+        self.assertEqual(row["actor"], "Owner")
+        self.assertEqual(row["action"], "reset data")
 
 
 if __name__ == "__main__":
