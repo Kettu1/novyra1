@@ -1796,7 +1796,8 @@ class CEOAgent(Agent):
 class DeveloperAgent(Agent):
     def heuristic(self, text):
         builds = self.runtime.db.memory_count("agent", self.id)
-        tid = self.runtime.db.task_create("Review request: %s" % text[:48],                                          self.name, self.dept)
+        tid = self.runtime.db.task_create("Review request: %s" % text[:48],
+                                          self.name, self.dept)
         return ("Developer Agent online. Codebase v%s. I have built %d "
                 "agents so far. I logged your request as T%03d. "
                 "Restrictions in force: I cannot create or activate "
