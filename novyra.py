@@ -997,7 +997,8 @@ class Database:
     def task_stats(self, dept=None):
         if dept:
             rows = self.conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks WHERE dept = ? "                "GROUP BY status", (dept,)).fetchall()
+                "SELECT status, COUNT(*) AS n FROM tasks WHERE dept = ? "
+                "GROUP BY status", (dept,)).fetchall()
         else:
             rows = self.conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status") \
@@ -1996,7 +1997,8 @@ class CEOAgent(Agent):
                      "%+.2f (owner-settled %+.2f, model-settled "
                      "%+.2f), %d open positions, exposure %s"
                      % (money(book.bankroll), book.realized_pnl(),
-                        book.realized_pnl("owner"),                        book.realized_pnl()
+                        book.realized_pnl("owner"),
+                        book.realized_pnl()
                         - book.realized_pnl("owner"),
                         len(book.open_bets()), money(book.open_exposure())))
         issues = rt.guardian.monitor()
@@ -2995,7 +2997,8 @@ class FinanceLedger:
         return self.db.conn.execute(
             "SELECT * FROM forecasts ORDER BY fid").fetchall()
 
-    def forecast_vs_actual(self, period):        """Compare recorded forecasts against confirmed actuals for
+    def forecast_vs_actual(self, period):
+        """Compare recorded forecasts against confirmed actuals for
         a period. Forecasts are never merged into actuals."""
         rows = [f for f in self.forecasts_all() if f["period"] == period]
         return {"forecasts": rows,
@@ -3995,6 +3998,7 @@ class CLI:
             return
         reply = hit.act(parts[1].strip())
         print_block(hit.name, reply)
+
     def cmd_guardian(self, rest):
         rt = self.rt
         hdr("GUARDIAN INTEGRITY SCAN")
