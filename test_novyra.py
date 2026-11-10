@@ -23,6 +23,14 @@ headroom freed by settlement, Guardian consistency and tamper
 detection), and owner-settled vs model-settled reporting separation
 (PnL helpers, 'bets' output tags and the manager report's headline
 win rate, which counts only Owner-supplied results).
+New for 0.3.0-dev Phase 1 (CEO core): strategic goals (lifecycle,
+persistence, task counts, reset), full task records (extended
+fields, status validation, history, result submission, overdue
+detection, and the backward-compatible migration from a real
+0.2.2-schema database), the bounded CEO review cycle (delegation,
+verification that never assumes a result, escalation, emergency
+stop, decision logging), and the stored-not-enforced config
+surface plus the new CLI commands.
 No network access or LLM endpoint is required.
 
 Every runtime and database opened by a test is closed in teardown,
@@ -889,8 +897,7 @@ class TestAuditLogging(NovyraCase):
     def test_stop_resume_and_autonomy_changes_are_recorded(self):
         rt = make_runtime()
         rt.permissions.halt()
-        rt.permissions.do_resume()
-        rt.set_autonomy(True)
+        rt.permissions.do_resume()        rt.set_autonomy(True)
         rt.set_autonomy(False)
         rows = [(r["actor"], r["action"], r["allowed"])
                 for r in rt.db.conn.execute(
@@ -1117,6 +1124,327 @@ class TestResultSetSeparation(NovyraCase):
         self.assertIn("(owner-settled +45.00, model-settled "
                       "+120.00)", text)
         self.assertNotIn("75.0%", text)
+
+
+class TestGoals(NovyraCase):
+    """Phase 1: strategic goals are persistent, validated and wiped
+    by reset like all operational data."""
+
+    def setUp(self):
+        self.db = N.Database(":memory:")
+
+    def test_goal_lifecycle(self):
+        gid = self.db.goal_create("Grow revenue", "more sales",
+                                  "10 new customers", "2026-12-31")
+        g = self.db.goal_get(gid)
+        self.assertEqual(g["title"], "Grow revenue")
+        self.assertEqual(g["objective"], "more sales")
+        self.assertEqual(g["success_criteria"], "10 new customers")
+        self.assertEqual(g["target_date"], "2026-12-31")
+        self.assertEqual(g["status"], "active")
+        self.db.goal_set_status(gid, "achieved")
+        self.assertEqual(self.db.goal_get(gid)["status"], "achieved")
+
+    def test_goal_unknown_id_and_status_rejected(self):
+        with self.assertRaises(N.NovyraError):
+            self.db.goal_get(999)
+        with self.assertRaises(N.NovyraError):
+            self.db.goal_set_status(999, "active")
+        gid = self.db.goal_create("x")
+        with self.assertRaises(N.NovyraError):
+            self.db.goal_set_status(gid, "bogus")
+
+    def test_goal_persists_across_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "t.db")
+            db = N.Database(path)
+            gid = db.goal_create("Persist", success_criteria="still there")
+            db.close()
+            db2 = N.Database(path)
+            self.addCleanup(db2.close)
+            self.assertEqual(db2.goal_get(gid)["success_criteria"],
+                             "still there")
+
+    def test_goal_task_counts(self):
+        gid = self.db.goal_create("G")
+        self.db.task_create("a", "CEO Agent", "Exec", goal_id=gid)
+        self.db.task_create("b", "CEO Agent", "Exec", goal_id=gid)
+        self.db.task_create("c", "CEO Agent", "Exec")
+        self.assertEqual(self.db.goal_task_counts(), {gid: 2})
+
+    def test_reset_wipes_goals(self):
+        rt = make_runtime()
+        rt.db.goal_create("Temporary goal")
+        rt.reset_data()
+        self.assertEqual(rt.db.goals_all(), [])
+
+
+class TestTaskFields(NovyraCase):
+    """Phase 1: full task records, backward-compatible migration from
+    a real 0.2.2-schema database, and result submission."""
+
+    def setUp(self):
+        self.db = N.Database(":memory:")
+
+    def test_extended_create_roundtrip(self):
+        tid = self.db.task_create(
+            "Ship it", "CEO Agent", "Exec", priority="high", goal_id=1,
+            deadline="2026-12-31", cost_estimate=5.0,
+            expected_impact="big", risk_level="low",
+            success_criteria="shipped and verified")
+        t = self.db.task_get(tid)
+        self.assertEqual(t["goal_id"], 1)
+        self.assertEqual(t["deadline"], "2026-12-31")
+        self.assertAlmostEqual(t["cost_estimate"], 5.0)
+        self.assertEqual(t["expected_impact"], "big")
+        self.assertEqual(t["risk_level"], "low")
+        self.assertEqual(t["success_criteria"], "shipped and verified")
+        self.assertEqual(t["status"], "pending")
+        self.assertEqual(t["history"], "")
+        self.assertIsNone(t["verified_result"])
+
+    def test_backward_compatible_create_signature(self):
+        tid = self.db.task_create("Old style", "CEO Agent", "Exec")
+        t = self.db.task_get(tid)
+        self.assertIsNone(t["goal_id"])
+        self.assertIsNone(t["deadline"])
+        self.assertEqual(t["status"], "pending")
+
+    def test_status_flow_is_validated(self):
+        tid = self.db.task_create("x", "CEO Agent", "Exec")
+        for status in ("delegated", "in_progress", "verifying",
+                       "done", "failed"):
+            self.db.task_set_status(tid, status)
+        with self.assertRaises(N.NovyraError):
+            self.db.task_set_status(tid, "bogus")
+
+    def test_task_get_unknown_rejected(self):
+        with self.assertRaises(N.NovyraError):
+            self.db.task_get(999)
+
+    def test_empty_result_cannot_be_submitted(self):
+        tid = self.db.task_create("x", "CEO Agent", "Exec")
+        with self.assertRaises(N.NovyraError):
+            self.db.task_report(tid, "   ")
+        self.assertEqual(self.db.task_get(tid)["status"], "pending")
+
+    def test_task_report_records_history_and_moves_to_verifying(self):
+        tid = self.db.task_create("x", "CEO Agent", "Exec")
+        self.db.task_history_append(tid, "started work")
+        self.db.task_report(tid, "Finished the draft")
+        t = self.db.task_get(tid)
+        self.assertEqual(t["status"], "verifying")
+        self.assertIn("started work", t["history"])
+        self.assertIn("result submitted: Finished the draft",
+                      t["history"])
+
+    def test_overdue_detection_ignores_done_and_future(self):
+        late = self.db.task_create("late", "CEO Agent", "Exec",
+                                   deadline="2000-01-01")
+        finished = self.db.task_create("old but done", "CEO Agent", "Exec",
+                                       deadline="2000-01-01")
+        self.db.task_set_status(finished, "done")
+        future = self.db.task_create("future", "CEO Agent", "Exec",
+                                     deadline="2999-01-01")
+        ids = [t["tid"] for t in self.db.tasks_overdue(today="2026-01-01")]
+        self.assertIn(late, ids)
+        self.assertNotIn(finished, ids)
+        self.assertNotIn(future, ids)
+
+    def test_migration_from_a_real_0_2_2_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.db")
+            old = sqlite3.connect(path)
+            old.execute(
+                "CREATE TABLE tasks (tid INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "title TEXT NOT NULL, owner TEXT NOT NULL, dept TEXT NOT NULL, "
+                "priority TEXT NOT NULL DEFAULT 'normal', "
+                "status TEXT NOT NULL DEFAULT 'pending', "
+                "note TEXT NOT NULL DEFAULT '', created TEXT NOT NULL)")
+            old.execute(
+                "INSERT INTO tasks (title, owner, dept, status, created) "
+                "VALUES ('legacy', 'CEO Agent', 'Exec', 'done', "
+                "'2026-01-01T00:00:00')")
+            old.commit()
+            old.close()
+            db = N.Database(path)
+            self.addCleanup(db.close)
+            # the legacy row survives with every value intact
+            t = db.task_get(1)
+            self.assertEqual(t["title"], "legacy")
+            self.assertEqual(t["status"], "done")
+            self.assertIsNone(t["goal_id"])
+            self.assertEqual(t["risk_level"], "normal")
+            self.assertEqual(t["history"], "")
+            # and the migrated database accepts new-style tasks
+            tid = db.task_create("new", "CEO Agent", "Exec", goal_id=1)
+            self.assertEqual(db.task_get(tid)["goal_id"], 1)
+
+
+class TestCEOReview(NovyraCase):
+    """Phase 1: the bounded CEO review cycle. The CEO delegates,
+    verifies submitted results and escalates; it never assumes a
+    result and never acts during an emergency stop."""
+
+    def _goal_and_task(self, rt, dept="Marketing Department"):
+        gid = rt.db.goal_create("Launch campaign")
+        rt.activate_department(dept)
+        tid = rt.db.task_create("Draft copy", "CEO Agent", dept,
+                                goal_id=gid)
+        return gid, tid
+
+    def test_review_delegates_pending_goal_tasks(self):
+        rt = make_runtime()
+        gid, tid = self._goal_and_task(rt)
+        out = rt.ceo.review_cycle()
+        self.assertIn("Delegated T%03d" % tid, out)
+        self.assertEqual(rt.db.task_get(tid)["status"], "delegated")
+        self.assertTrue(any("Delegate T%03d" % tid in d["question"]
+                            for d in rt.db.decisions_all()))
+
+    def test_review_skips_tasks_without_goal_or_manager(self):
+        rt = make_runtime()
+        plain = rt.db.task_create("No goal", "CEO Agent",
+                                  "Marketing Department")
+        gid = rt.db.goal_create("G")
+        orphan = rt.db.task_create("No manager", "CEO Agent",
+                                   "Trading Department", goal_id=gid)
+        rt.ceo.review_cycle()
+        self.assertEqual(rt.db.task_get(plain)["status"], "pending")
+        self.assertEqual(rt.db.task_get(orphan)["status"], "pending")
+
+    def test_review_verifies_submitted_result_and_records_evidence(self):
+        rt = make_runtime()
+        gid, tid = self._goal_and_task(rt)
+        rt.db.task_report(tid, "Copy drafted and approved")
+        out = rt.ceo.review_cycle()
+        t = rt.db.task_get(tid)
+        self.assertEqual(t["status"], "done")
+        self.assertIn("Copy drafted and approved", t["verified_result"])
+        self.assertEqual(t["verification"], "verified by CEO review")
+        self.assertIn("Verified T%03d" % tid, out)
+
+    def test_review_never_assumes_done_without_a_result(self):
+        rt = make_runtime()
+        gid, tid = self._goal_and_task(rt)
+        rt.db.task_set_status(tid, "verifying")  # no result submitted
+        out = rt.ceo.review_cycle()
+        self.assertNotEqual(rt.db.task_get(tid)["status"], "done")
+        self.assertIn("Escalated T%03d" % tid, out)
+        self.assertTrue(any("not assumed done" in d["reason"]
+                            for d in rt.db.decisions_all()))
+
+    def test_review_blocked_during_emergency_stop(self):
+        rt = make_runtime()
+        gid, tid = self._goal_and_task(rt)
+        rt.permissions.halt()
+        out = rt.ceo.review_cycle()
+        self.assertIn("Emergency stop", out)
+        self.assertEqual(rt.db.task_get(tid)["status"], "pending")
+
+    def test_review_escalates_overdue_tasks(self):
+        rt = make_runtime()
+        rt.db.task_create("Late thing", "CEO Agent", "Exec",
+                          deadline="2000-01-01")
+        out = rt.ceo.review_cycle()
+        self.assertIn("deadline 2000-01-01 passed", out)
+        self.assertTrue(any("Escalate overdue" in d["question"]
+                            for d in rt.db.decisions_all()))
+
+    def test_review_is_bounded(self):
+        rt = make_runtime()
+        rt.activate_department("Marketing Department")
+        gid = rt.db.goal_create("Many tasks")
+        for i in range(15):
+            rt.db.task_create("task %d" % i, "CEO Agent",
+                              "Marketing Department", goal_id=gid)
+        out = rt.ceo.review_cycle()
+        delegated = [t for t in rt.db.tasks_all()
+                     if t["status"] == "delegated"]
+        self.assertEqual(len(delegated), N.MAX_REVIEW_ACTIONS)
+        self.assertIn("Review cap reached", out)
+
+    def test_review_on_a_quiet_board(self):
+        rt = make_runtime()
+        out = rt.ceo.review_cycle()
+        self.assertIn("Nothing to delegate", out)
+
+    def test_daily_report_includes_goals_and_verification_counts(self):
+        rt = make_runtime()
+        gid, tid = self._goal_and_task(rt)
+        rt.db.task_report(tid, "result here")
+        rt.ceo.review_cycle()
+        text = rt.ceo.daily_report()
+        self.assertIn("Goal G%03d" % gid, text)
+        self.assertIn("verified done: 1", text)
+
+
+class TestPhase1ConfigAndCLI(NovyraCase):
+    """Phase 1: the stored-not-enforced config surface and the new
+    CLI commands."""
+
+    def test_config_defaults_and_unknown_keys(self):
+        db = N.Database(":memory:")
+        self.addCleanup(db.close)
+        self.assertEqual(db.config_get("autonomy_threshold"), "0.87")
+        self.assertEqual(db.config_get("max_autonomous_spend"), "100.00")
+        self.assertIsNone(db.config_get("daily_autonomous_budget"))
+        with self.assertRaises(N.NovyraError):
+            db.config_get("not_a_key")
+        with self.assertRaises(N.NovyraError):
+            db.config_set("not_a_key", "1")
+
+    def test_config_set_validates_values(self):
+        db = N.Database(":memory:")
+        self.addCleanup(db.close)
+        db.config_set("autonomy_threshold", "0.9")
+        self.assertEqual(db.config_get("autonomy_threshold"), "0.9")
+        db.config_set("max_autonomous_spend", 250)
+        self.assertEqual(db.config_get("max_autonomous_spend"), "250.00")
+        db.config_set("daily_autonomous_budget", "50")
+        self.assertEqual(db.config_get("daily_autonomous_budget"), "50.00")
+        db.config_set("daily_autonomous_budget", None)  # unset again
+        self.assertIsNone(db.config_get("daily_autonomous_budget"))
+        with self.assertRaises(N.NovyraError):
+            db.config_set("autonomy_threshold", "abc")
+        with self.assertRaises(N.NovyraError):
+            db.config_set("max_autonomous_spend", "-1")
+
+    def test_cli_goal_and_goals_commands(self):
+        rt = make_runtime()
+        cli = N.CLI(rt)
+        cli.dispatch("goal Grow revenue | sell more | 10 deals | "
+                     "2026-12-31")
+        goals = rt.db.goals_all()
+        self.assertEqual(len(goals), 1)
+        self.assertEqual(goals[0]["title"], "Grow revenue")
+        self.assertEqual(goals[0]["target_date"], "2026-12-31")
+        cli.dispatch("goal Bad date | x | y | 31-12-2026")  # rejected
+        self.assertEqual(len(rt.db.goals_all()), 1)
+
+    def test_cli_review_and_bad_phase1_inputs_do_not_crash(self):
+        rt = make_runtime()
+        cli = N.CLI(rt)
+        for line in ("goals", "goal", "review", "review extra args",
+                     "goal | | | 2026-13-99"):
+            cli.dispatch(line)  # must not raise
+        self.assertEqual(rt.db.goals_all(), [])
+
+    def test_tasks_command_shows_goal_deadline_and_verification(self):
+        rt = make_runtime()
+        gid = rt.db.goal_create("G")
+        tid = rt.db.task_create("Visible", "CEO Agent", "Exec",
+                                goal_id=gid, deadline="2026-12-31")
+        rt.db.task_report(tid, "done deal")
+        rt.ceo.review_cycle()
+        cli = N.CLI(rt)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.dispatch("tasks")
+        out = buf.getvalue()
+        self.assertIn("goal G%03d" % gid, out)
+        self.assertIn("due 2026-12-31", out)
+        self.assertIn("[verified]", out)
 
 
 if __name__ == "__main__":
