@@ -997,7 +997,8 @@ class TestAggregateExposure(NovyraCase):
     never flag a bet the book accepted.
 
     The per-bet cap is 2% of the current bankroll, which shrinks
-    with every placement, so four successive maximum bets are    200.00, 196.00, 192.08 and 188.23 (all in integer cents, never
+    with every placement, so four successive maximum bets are
+    200.00, 196.00, 192.08 and 188.23 (all in integer cents, never
     rounded up). After them the bankroll is 9223.69 with 776.31 at
     risk (8.4%), and the aggregate cap allows exactly one more
     132.78 stake (909.09 = int(0.10 * 909091)); one cent more is
@@ -1996,7 +1997,8 @@ class TestFinanceCLIAndCEO(NovyraCase):
         self.assertEqual(self.fin.expense_cents(business="shop"), 30000)
         self.assertEqual(self.fin.operating_profit_cents(business="shop"),
                          95050)
-        out = self._out("finance transactions")        self.assertIn("revenue", out)
+        out = self._out("finance transactions")
+        self.assertIn("revenue", out)
         self.assertIn("[owner]", out)
 
     def test_cli_opening_balance(self):
