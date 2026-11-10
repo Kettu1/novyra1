@@ -897,7 +897,8 @@ class TestAuditLogging(NovyraCase):
     def test_stop_resume_and_autonomy_changes_are_recorded(self):
         rt = make_runtime()
         rt.permissions.halt()
-        rt.permissions.do_resume()        rt.set_autonomy(True)
+        rt.permissions.do_resume()
+        rt.set_autonomy(True)
         rt.set_autonomy(False)
         rows = [(r["actor"], r["action"], r["allowed"])
                 for r in rt.db.conn.execute(
