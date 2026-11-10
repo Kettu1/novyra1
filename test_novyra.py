@@ -31,6 +31,18 @@ detection, and the backward-compatible migration from a real
 verification that never assumes a result, escalation, emergency
 stop, decision logging), and the stored-not-enforced config
 surface plus the new CLI commands.
+New for 0.3.0-dev Phase 2 (Finance & KPI): the append-only financial
+ledger (integer cents, EUR-only, opening balances distinct from
+revenue), provenance enforced by code path (OwnerSession capability
+token plus approval for owner entries, hard-coded estimate provenance
+for agent entries, simulated results unbookable), database-level
+immutability (triggers + connection authorizer, controlled atomic
+reset with guaranteed restoration, fault-injection coverage), the
+separate forecasts table, event-based task KPIs (period assignment by
+completion event, re-completions counted once, documented denominator
+that cannot exceed 100%, verification snapshots that later edits
+cannot rewrite), general-numeric KPI snapshots with units, and the
+finance CLI and CEO reporting separation.
 No network access or LLM endpoint is required.
 
 Every runtime and database opened by a test is closed in teardown,
@@ -67,6 +79,19 @@ def make_runtime(db_path=":memory:"):
     return rt
 
 
+# bare Database connections opened directly by a test; swept in
+# teardown so a failing test can never leak a SQLite connection
+_OPEN_DBS = []
+
+
+def make_db(path=":memory:"):
+    """Database whose connection is closed automatically in teardown,
+    even when the test fails before its own cleanup runs."""
+    db = N.Database(path)
+    _OPEN_DBS.append(db)
+    return db
+
+
 class NovyraCase(unittest.TestCase):
     """Shared teardown: closes every Runtime (and the bare Database on
     self.db) the test opened, so no SQLite connection outlives its
@@ -77,6 +102,12 @@ class NovyraCase(unittest.TestCase):
             rt = _OPEN_RUNTIMES.pop()
             try:
                 rt.close()
+            except Exception:
+                pass
+        while _OPEN_DBS:
+            db = _OPEN_DBS.pop()
+            try:
+                db.close()
             except Exception:
                 pass
         db = getattr(self, "db", None)
@@ -111,7 +142,7 @@ class TestMath(NovyraCase):
 
 class TestDatabase(NovyraCase):
     def setUp(self):
-        self.db = N.Database(":memory:")
+        self.db = make_db()
 
     def test_kv_roundtrip(self):
         self.db.kv_set("x", "42")
@@ -966,8 +997,7 @@ class TestAggregateExposure(NovyraCase):
     never flag a bet the book accepted.
 
     The per-bet cap is 2% of the current bankroll, which shrinks
-    with every placement, so four successive maximum bets are
-    200.00, 196.00, 192.08 and 188.23 (all in integer cents, never
+    with every placement, so four successive maximum bets are    200.00, 196.00, 192.08 and 188.23 (all in integer cents, never
     rounded up). After them the bankroll is 9223.69 with 776.31 at
     risk (8.4%), and the aggregate cap allows exactly one more
     132.78 stake (909.09 = int(0.10 * 909091)); one cent more is
@@ -1132,7 +1162,7 @@ class TestGoals(NovyraCase):
     by reset like all operational data."""
 
     def setUp(self):
-        self.db = N.Database(":memory:")
+        self.db = make_db()
 
     def test_goal_lifecycle(self):
         gid = self.db.goal_create("Grow revenue", "more sales",
@@ -1185,7 +1215,7 @@ class TestTaskFields(NovyraCase):
     a real 0.2.2-schema database, and result submission."""
 
     def setUp(self):
-        self.db = N.Database(":memory:")
+        self.db = make_db()
 
     def test_extended_create_roundtrip(self):
         tid = self.db.task_create(
@@ -1385,8 +1415,7 @@ class TestPhase1ConfigAndCLI(NovyraCase):
     CLI commands."""
 
     def test_config_defaults_and_unknown_keys(self):
-        db = N.Database(":memory:")
-        self.addCleanup(db.close)
+        db = make_db()
         self.assertEqual(db.config_get("autonomy_threshold"), "0.87")
         self.assertEqual(db.config_get("max_autonomous_spend"), "100.00")
         self.assertIsNone(db.config_get("daily_autonomous_budget"))
@@ -1396,8 +1425,7 @@ class TestPhase1ConfigAndCLI(NovyraCase):
             db.config_set("not_a_key", "1")
 
     def test_config_set_validates_values(self):
-        db = N.Database(":memory:")
-        self.addCleanup(db.close)
+        db = make_db()
         db.config_set("autonomy_threshold", "0.9")
         self.assertEqual(db.config_get("autonomy_threshold"), "0.9")
         db.config_set("max_autonomous_spend", 250)
@@ -1446,6 +1474,595 @@ class TestPhase1ConfigAndCLI(NovyraCase):
         self.assertIn("goal G%03d" % gid, out)
         self.assertIn("due 2026-12-31", out)
         self.assertIn("[verified]", out)
+
+
+class TestOwnerSessionAndProvenance(NovyraCase):
+    """Phase 2: provenance is enforced by code path. Only the
+    OwnerSession token holder can book confirmed entries; agents can
+    only produce estimates; simulated results are unbookable."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.fin = self.rt.finance
+        self.session = N.OwnerSession()
+
+    def test_owner_entry_requires_capability_token(self):
+        with self.assertRaises(N.NovyraError):
+            self.fin.record_owner_entry(None, "revenue", 100)
+        with self.assertRaises(N.NovyraError):
+            self.fin.record_owner_entry("Owner", "revenue", 100)
+        with self.assertRaises(N.NovyraError):
+            self.fin.record_owner_entry(object(), "revenue", 100)
+        self.assertEqual(self.fin.transactions_count(), 0)
+
+    def test_owner_entry_records_owner_provenance(self):
+        txid = self.fin.record_owner_entry(self.session, "revenue", 100,
+                                           business="shop",
+                                           category="sales")
+        row = self.rt.db.conn.execute(
+            "SELECT * FROM transactions WHERE txid = ?", (txid,)).fetchone()
+        self.assertEqual(row["source"], "owner")
+        self.assertEqual(row["created_by"], "Owner")
+        self.assertIsNone(row["agent"])
+        self.assertEqual(row["amount_cents"], 10000)
+        self.assertEqual(row["currency"], "EUR")
+        # the booking was approval-gated and audited
+        self.assertTrue(self.rt.db.approvals_count() >= 1)
+
+    def test_declined_owner_entry_records_nothing(self):
+        self.rt.ask_owner = lambda question: False
+        self.assertIsNone(self.fin.record_owner_entry(self.session,
+                                                      "revenue", 100))
+        self.assertEqual(self.fin.transactions_count(), 0)
+
+    def test_agent_entry_forced_to_estimate(self):
+        txid = self.fin.record_agent_entry("Revenue Tracking", "revenue",
+                                           250, business="shop")
+        row = self.rt.db.conn.execute(
+            "SELECT * FROM transactions WHERE txid = ?", (txid,)).fetchone()
+        self.assertEqual(row["source"], "estimate")
+        self.assertEqual(row["created_by"], "Revenue Tracking")
+        self.assertEqual(row["agent"], "Revenue Tracking")
+        # it is a watched action in the audit trail
+        self.assertTrue(any("record revenue estimate" == a["action"]
+                            for a in self.rt.db.conn.execute(
+                                "SELECT * FROM actions").fetchall()))
+
+    def test_agent_entry_blocked_during_emergency_stop(self):
+        self.rt.permissions.halt()
+        self.assertIsNone(self.fin.record_agent_entry(
+            "Revenue Tracking", "revenue", 250))
+        self.assertEqual(self.fin.transactions_count(), 0)
+
+    def test_simulated_source_is_unbookable(self):
+        # there is no simulated source in the ledger at all; even raw
+        # SQL cannot book one (CHECK constraint)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.rt.db.conn.execute(
+                "INSERT INTO transactions (ts, kind, amount_cents, "
+                "source, created_by, created) VALUES (?, 'revenue', 100, "
+                "'simulated', 'x', ?)", (N.now_str(), N.now_str()))
+
+    def test_unsupported_currency_rejected(self):
+        with self.assertRaises(N.NovyraError):
+            self.fin.record_owner_entry(self.session, "revenue", 100,
+                                        currency="USD")
+        with self.assertRaises(N.NovyraError):
+            self.fin.record_agent_entry("Revenue Tracking", "revenue",
+                                        100, currency="SEK")
+        self.assertEqual(self.fin.transactions_count(), 0)
+
+    def test_non_positive_amount_rejected(self):
+        for bad in (0, -5, 0.001):  # 0.001 rounds to zero cents
+            with self.assertRaises(N.NovyraError):
+                self.fin.record_owner_entry(self.session, "revenue", bad)
+            with self.assertRaises(N.NovyraError):
+                self.fin.record_agent_entry("Revenue Tracking",
+                                            "expense", bad)
+
+    def test_corrections_are_offsetting_entries(self):
+        first = self.fin.record_owner_entry(self.session, "revenue", 100)
+        correction = self.fin.record_offsetting_correction(
+            self.session, first, note="wrong amount")
+        rows = self.fin.transactions_tail(10)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["kind"], "expense")
+        self.assertIn("correction of #%d" % first, rows[1]["note"])
+        self.assertEqual(self.fin.operating_profit_cents(), 0)
+        # opening balances are not offset, they are re-recorded
+        opening = self.fin.record_owner_entry(self.session,
+                                              "opening_balance", 500)
+        with self.assertRaises(N.NovyraError):
+            self.fin.record_offsetting_correction(self.session, opening)
+
+
+class TestFinancialMaths(NovyraCase):
+    """Phase 2: confirmed figures only in the headline numbers,
+    integer-cent precision, opening balances distinct from revenue."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.fin = self.rt.finance
+        self.session = N.OwnerSession()
+
+    def test_revenue_expense_and_profit(self):
+        self.fin.record_owner_entry(self.session, "revenue", 300)
+        self.fin.record_owner_entry(self.session, "revenue", 250.50)
+        self.fin.record_owner_entry(self.session, "expense", 120)
+        self.assertEqual(self.fin.revenue_cents(), 55050)
+        self.assertEqual(self.fin.expense_cents(), 12000)
+        self.assertEqual(self.fin.operating_profit_cents(), 43050)
+
+    def test_opening_balance_is_not_revenue(self):
+        self.fin.record_owner_entry(self.session, "opening_balance", 5000)
+        self.fin.record_owner_entry(self.session, "revenue", 300)
+        self.assertEqual(self.fin.revenue_cents(), 30000)
+        self.assertEqual(self.fin.opening_balance_cents(), 500000)
+        self.assertEqual(self.fin.cash_position_cents(), 530000)
+        self.assertEqual(self.fin.cash_flow_cents(), 30000)
+
+    def test_cash_flow_excludes_opening_balances(self):
+        self.fin.record_owner_entry(self.session, "opening_balance", 1000)
+        self.fin.record_owner_entry(self.session, "revenue", 400)
+        self.fin.record_owner_entry(self.session, "expense", 150)
+        self.assertEqual(self.fin.cash_flow_cents(), 25000)
+        self.assertEqual(self.fin.cash_position_cents(), 125000)
+
+    def test_per_business_split(self):
+        self.fin.record_owner_entry(self.session, "revenue", 100,
+                                    business="shop")
+        self.fin.record_owner_entry(self.session, "revenue", 50,
+                                    business="shop")
+        self.fin.record_owner_entry(self.session, "revenue", 30,
+                                    business="agency")
+        self.fin.record_owner_entry(self.session, "expense", 20,
+                                    business="shop")
+        self.assertEqual(self.fin.revenue_cents(business="shop"), 15000)
+        self.assertEqual(self.fin.revenue_cents(business="agency"), 3000)
+        self.assertEqual(self.fin.expense_cents(business="shop"), 2000)
+        self.assertEqual(self.fin.operating_profit_cents(business="shop"),
+                         13000)
+
+    def test_per_category_split(self):
+        self.fin.record_owner_entry(self.session, "expense", 100,
+                                    category="salaries")
+        self.fin.record_owner_entry(self.session, "expense", 40,
+                                    category="salaries")
+        self.fin.record_owner_entry(self.session, "expense", 25,
+                                    category="tools")
+        self.assertEqual(self.fin.by_category("expense"),
+                         {"salaries": 14000, "tools": 2500})
+
+    def test_estimates_never_enter_confirmed_figures(self):
+        self.fin.record_owner_entry(self.session, "revenue", 100)
+        self.fin.record_agent_entry("Revenue Tracking", "revenue", 999)
+        self.fin.record_agent_entry("Expense Management", "expense", 500)
+        self.assertEqual(self.fin.revenue_cents(), 10000)
+        self.assertEqual(self.fin.expense_cents(), 0)
+        self.assertEqual(self.fin.estimate_cents("revenue"), 99900)
+        self.assertEqual(self.fin.estimate_cents("expense"), 50000)
+
+    def test_cent_precision(self):
+        self.fin.record_owner_entry(self.session, "revenue", 0.10)
+        self.fin.record_owner_entry(self.session, "revenue", 0.20)
+        self.fin.record_owner_entry(self.session, "revenue", 0.30)
+        # 0.1 + 0.2 in floats is 0.30000000000000004; in cents it is 60
+        self.assertEqual(self.fin.revenue_cents(), 60)
+
+    def test_runway_and_insufficient_data(self):
+        self.assertIsNone(self.fin.runway())
+        self.fin.record_owner_entry(self.session, "opening_balance", 700)
+        self.fin.record_owner_entry(self.session, "expense", 100)
+        self.fin.record_owner_entry(self.session, "expense", 200)
+        # cash position = 700 opening - 300 expenses = 400;
+        # one month of expenses so far: avg 300
+        self.assertEqual(self.fin.cash_position_cents(), 40000)
+        self.assertAlmostEqual(self.fin.runway(), 400 / 300)
+
+    def test_margin_and_runway_helpers(self):
+        self.assertAlmostEqual(N.profit_margin(25000, 100000), 0.25)
+        self.assertIsNone(N.profit_margin(100, 0))
+        self.assertIsNone(N.profit_margin(100, -5))
+        self.assertAlmostEqual(N.runway_months(1200000, 100000), 12.0)
+        self.assertIsNone(N.runway_months(500000, 0))
+
+    def test_empty_ledger_reports_zeros(self):
+        self.assertEqual(self.fin.revenue_cents(), 0)
+        self.assertEqual(self.fin.expense_cents(), 0)
+        self.assertEqual(self.fin.operating_profit_cents(), 0)
+        self.assertEqual(self.fin.cash_position_cents(), 0)
+        self.assertEqual(self.fin.cash_flow_cents(), 0)
+
+
+class TestTaskEventsAndKPIs(NovyraCase):
+    """Phase 2: append-only task events, period assignment by event
+    timestamp, documented denominator, verification snapshots."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.db = self.rt.db
+
+    def _insert_event(self, tid, ts, event, from_status, to_status,
+                      actor="test", detail=""):
+        self.db.conn.execute(
+            "INSERT INTO task_events (tid, ts, event, from_status, "
+            "to_status, actor, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tid, ts, event, from_status, to_status, actor, detail))
+        self.db.conn.commit()
+
+    def test_created_and_status_events_recorded(self):
+        tid = self.db.task_create("Write plan", "CEO Agent", "Exec")
+        kinds = [(e["event"], e["to_status"])
+                 for e in self.db.task_event_rows(tid)]
+        self.assertEqual(kinds, [("created", "pending")])
+        self.db.task_set_status(tid, "done", actor="CEO Agent")
+        kinds = [(e["event"], e["from_status"], e["to_status"])
+                 for e in self.db.task_event_rows(tid)]
+        self.assertEqual(kinds, [("created", None, "pending"),
+                                 ("status_change", "pending", "done")])
+
+    def _insert_task(self, title, created):
+        """Insert a task row with an explicit creation timestamp, for
+        period-assignment scenarios (task_create always uses now)."""
+        cur = self.db.conn.execute(
+            "INSERT INTO tasks (title, owner, dept, status, created) "
+            "VALUES (?, 'CEO Agent', 'Exec', 'pending', ?)",
+            (title, created))
+        self.db.conn.commit()
+        return cur.lastrowid
+
+    def test_reopen_recomplete_produces_two_done_events(self):
+        tid = self._insert_task("x", "2026-10-01T09:00:00")
+        self._insert_event(tid, "2026-10-05T10:00:00", "status_change",
+                           "pending", "done")
+        self._insert_event(tid, "2026-10-20T10:00:00", "status_change",
+                           "done", "pending")
+        self._insert_event(tid, "2026-11-05T10:00:00", "status_change",
+                           "pending", "done")
+        oct_k = self.db.task_completion_kpis("2026-10")
+        nov_k = self.db.task_completion_kpis("2026-11")
+        self.assertEqual(len(oct_k["completed"]), 1)
+        self.assertEqual(len(oct_k["eligible"]), 1)
+        self.assertEqual(len(nov_k["completed"]), 1)
+        self.assertEqual(len(nov_k["eligible"]), 1)
+        self.assertEqual(oct_k["events"], 1)
+        self.assertEqual(nov_k["events"], 1)
+
+    def test_completion_rate_cannot_exceed_100(self):
+        tid = self._insert_task("x", "2026-10-01T09:00:00")
+        self._insert_event(tid, "2026-10-05T10:00:00", "status_change",
+                           "pending", "done")
+        self._insert_event(tid, "2026-10-20T10:00:00", "status_change",
+                           "done", "pending")
+        self._insert_event(tid, "2026-10-25T10:00:00", "status_change",
+                           "pending", "done")
+        k = self.db.task_completion_kpis("2026-10")
+        # one unique task completed, one eligible, two raw events
+        self.assertEqual(len(k["completed"]), 1)
+        self.assertEqual(len(k["eligible"]), 1)
+        self.assertEqual(k["events"], 2)
+        self.assertLessEqual(len(k["completed"]), len(k["eligible"]))
+
+    def test_eligible_excludes_tasks_completed_before_period(self):
+        tid = self.db.task_create("old", "CEO Agent", "Exec")
+        self._insert_event(tid, "2026-09-05T10:00:00", "status_change",
+                           "pending", "done")
+        k = self.db.task_completion_kpis("2026-10")
+        self.assertEqual(len(k["completed"]), 0)
+        self.assertEqual(len(k["eligible"]), 0)
+
+    def test_eligible_includes_task_reopened_within_period(self):
+        # done in September, reopened and re-completed in November:
+        # November must count the task as eligible even though its
+        # status just before the period was done, and December (after
+        # the re-completion) must not count it at all
+        tid = self._insert_task("reopened", "2026-09-01T09:00:00")
+        self._insert_event(tid, "2026-09-05T10:00:00", "status_change",
+                           "pending", "done")
+        self._insert_event(tid, "2026-11-03T10:00:00", "status_change",
+                           "done", "in_progress")
+        self._insert_event(tid, "2026-11-06T10:00:00", "status_change",
+                           "in_progress", "done")
+        k = self.db.task_completion_kpis("2026-11")
+        self.assertEqual(len(k["eligible"]), 1)
+        self.assertEqual(len(k["completed"]), 1)
+        self.assertEqual(k["events"], 1)
+        k_dec = self.db.task_completion_kpis("2026-12")
+        self.assertEqual(len(k_dec["eligible"]), 0)
+        self.assertEqual(len(k_dec["completed"]), 0)
+
+    def test_eligible_excludes_tasks_created_after_period(self):
+        # created now (November); October must not count it
+        self.db.task_create("future", "CEO Agent", "Exec")
+        k = self.db.task_completion_kpis("2026-10")
+        self.assertEqual(len(k["eligible"]), 0)
+
+    def test_pre_phase2_completions_are_unattributed(self):
+        # a done task with no event history at all (legacy row)
+        self.db.conn.execute(
+            "INSERT INTO tasks (title, owner, dept, status, created) "
+            "VALUES ('legacy', 'CEO Agent', 'Exec', 'done', ?)",
+            (N.now_str(),))
+        self.db.conn.commit()
+        k = self.db.task_completion_kpis(N.now_str()[:7])
+        self.assertEqual(len(k["completed"]), 0)
+        self.assertEqual(len(k["unattributed"]), 1)
+
+    def test_verification_snapshot_at_completion(self):
+        rt = make_runtime()
+        gid = rt.db.goal_create("G")
+        rt.activate_department("Marketing Department")
+        tid = rt.db.task_create("Draft", "CEO Agent",
+                                "Marketing Department", goal_id=gid)
+        rt.db.task_report(tid, "The copy is finished")
+        rt.ceo.review_cycle()
+        done_events = [e for e in rt.db.task_event_rows(tid)
+                       if e["to_status"] == "done"]
+        self.assertEqual(len(done_events), 1)
+        self.assertTrue(done_events[0]["detail"].startswith("verified="))
+        self.assertIn("The copy is finished",
+                      done_events[0]["detail"])
+
+    def test_historical_kpi_unchanged_after_later_edit(self):
+        rt = make_runtime()
+        gid = rt.db.goal_create("G")
+        rt.activate_department("Marketing Department")
+        tid = rt.db.task_create("Draft", "CEO Agent",
+                                "Marketing Department", goal_id=gid)
+        rt.db.task_report(tid, "Original verified evidence")
+        rt.ceo.review_cycle()
+        period = N.now_str()[:7]
+        before = rt.db.verified_completion_count(period)
+        self.assertEqual(before, 1)
+        # a later edit of the current verification fields must not
+        # rewrite the historical snapshot
+        rt.db.task_update_verification(tid, "tampered result",
+                                       "edited", "CEO Agent")
+        self.assertEqual(rt.db.verified_completion_count(period), 1)
+        events = rt.db.task_event_rows(tid)
+        self.assertTrue(any(e["event"] == "verification_update"
+                            for e in events))
+        done_event = [e for e in events if e["to_status"] == "done"][0]
+        self.assertIn("Original verified evidence", done_event["detail"])
+
+    def test_verification_update_is_in_the_schema_constraint(self):
+        tid = self.db.task_create("x", "CEO Agent", "Exec")
+        self.db.task_update_verification(tid, "r", "v", "CEO Agent")
+        kinds = {e["event"] for e in self.db.task_event_rows(tid)}
+        self.assertIn("verification_update", kinds)
+        # and an unknown event kind is rejected by the CHECK itself
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.db.conn.execute(
+                "INSERT INTO task_events (tid, ts, event, actor) "
+                "VALUES (?, ?, 'bogus_event', 'x')",
+                (tid, N.now_str()))
+            self.db.conn.commit()
+
+    def test_report_event_recorded(self):
+        tid = self.db.task_create("x", "CEO Agent", "Exec")
+        self.db.task_report(tid, "Finished", actor="Data Collector")
+        events = self.db.task_event_rows(tid)
+        self.assertTrue(any(e["event"] == "report" for e in events))
+        self.assertEqual(events[-1]["to_status"], "verifying")
+
+    def test_goal_progress_kpi(self):
+        gid = self.db.goal_create("G")
+        a = self.db.task_create("a", "CEO Agent", "Exec", goal_id=gid)
+        self.db.task_create("b", "CEO Agent", "Exec", goal_id=gid)
+        self.db.task_set_status(a, "done")
+        counts = self.db.goal_task_counts()
+        done = len([t for t in self.db.tasks_all()
+                    if t["goal_id"] == gid and t["status"] == "done"])
+        self.assertEqual(counts[gid], 2)
+        self.assertEqual(done, 1)  # progress 1/2 = 50%
+
+
+class TestImmutabilityAndReset(NovyraCase):
+    """Phase 2: database-level append-only protection, the controlled
+    reset, and its guaranteed restoration."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.db = self.rt.db
+        self.fin = self.rt.finance
+        self.session = N.OwnerSession()
+        self.fin.record_owner_entry(self.session, "revenue", 100)
+
+    def _assert_blocked(self, sql, params=()):
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.db.conn.execute(sql, params)
+            self.db.conn.commit()
+
+    def test_update_and_delete_blocked_on_all_protected_tables(self):
+        self._assert_blocked(
+            "UPDATE transactions SET amount_cents = 1")
+        self._assert_blocked("DELETE FROM transactions")
+        self._assert_blocked("UPDATE forecasts SET amount_cents = 1")
+        self._assert_blocked("DELETE FROM forecasts")
+        self._assert_blocked("UPDATE kpis SET value = 1")
+        self._assert_blocked("DELETE FROM kpis")
+        self._assert_blocked("UPDATE task_events SET detail = 'x'")
+        self._assert_blocked("DELETE FROM task_events")
+        # nothing was destroyed
+        self.assertEqual(self.fin.transactions_count(), 1)
+
+    def test_inserts_still_work_while_protected(self):
+        self.fin.record_owner_entry(self.session, "expense", 30)
+        self.assertEqual(self.fin.transactions_count(), 2)
+
+    def test_drop_trigger_blocked_while_locked(self):
+        self._assert_blocked("DROP TRIGGER transactions_no_update")
+        # and the trigger still protects
+        self._assert_blocked("DELETE FROM transactions")
+
+    def test_reset_wipes_protected_tables_and_restores_protection(self):
+        self.rt.db.reset_data()
+        self.assertEqual(self.fin.transactions_count(), 0)
+        present = {r["name"] for r in self.db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()}
+        for name in N.PROTECTED_TRIGGER_NAMES:
+            self.assertIn(name, present)
+        # protection is active again
+        self._assert_blocked("DELETE FROM transactions")
+        self._assert_blocked("UPDATE transactions SET amount_cents = 1")
+        # and new entries work
+        self.fin.record_owner_entry(self.session, "revenue", 5)
+        self.assertEqual(self.fin.transactions_count(), 1)
+
+    def test_failed_reset_leaves_database_intact(self):
+        # fault injection: a wipe step fails mid-procedure
+        original = N.PROTECTED_TABLES
+        N.PROTECTED_TABLES = ("transactions", "bogus_table")
+        try:
+            with self.assertRaises(sqlite3.DatabaseError):
+                self.db.reset_protected_data()
+        finally:
+            N.PROTECTED_TABLES = original
+        # the transaction rolled back: data intact, lock re-engaged,
+        # all triggers present, protection active
+        self.assertEqual(self.fin.transactions_count(), 1)
+        self.assertTrue(self.db._financial_lock)
+        present = {r["name"] for r in self.db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        ).fetchall()}
+        for name in N.PROTECTED_TRIGGER_NAMES:
+            self.assertIn(name, present)
+        self._assert_blocked("DELETE FROM transactions")
+        # the ledger still works after the failed reset
+        self.fin.record_owner_entry(self.session, "expense", 10)
+        self.assertEqual(self.fin.transactions_count(), 2)
+
+    def test_guardian_flags_missing_trigger(self):
+        # simulate external tampering: drop a trigger with the lock
+        # released (the only way), then scan
+        self.db._financial_lock = False
+        try:
+            self.db.conn.execute("DROP TRIGGER transactions_no_update")
+            self.db.conn.commit()
+        finally:
+            self.db._financial_lock = True
+        findings = self.rt.guardian.full_scan()
+        self.assertTrue(any("trigger" in f.lower() and "missing"
+                            in f.lower() for f in findings))
+
+    def test_reset_is_owner_approved_and_audited(self):
+        cli = N.CLI(self.rt)
+        cli.dispatch("reset")  # make_runtime auto-approves
+        self.assertTrue(self.rt.db.approvals_count() >= 1)
+        self.assertTrue(any("reset" in a["action"]
+                            for a in self.rt.db.conn.execute(
+                                "SELECT * FROM actions").fetchall()))
+
+    def test_correction_path_works_despite_immutability(self):
+        first = self.fin.transactions_tail(1)[0]["txid"]
+        self.fin.record_offsetting_correction(self.session, first)
+        rows = self.fin.transactions_tail(10)
+        self.assertEqual(len(rows), 2)
+        # the original row is untouched
+        self.assertEqual(rows[0]["amount_cents"], 10000)
+        self.assertEqual(rows[0]["kind"], "revenue")
+
+
+class TestFinanceCLIAndCEO(NovyraCase):
+    """Phase 2: the finance CLI, CEO reporting separation and the
+    relabelled Finance Department metrics."""
+
+    def setUp(self):
+        self.rt = make_runtime()
+        self.cli = N.CLI(self.rt)
+        self.fin = self.rt.finance
+        self.session = self.cli.owner_session
+
+    def _out(self, line):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.cli.dispatch(line)
+        return buf.getvalue()
+
+    def test_finance_summary_sections(self):
+        self.fin.record_owner_entry(self.session, "revenue", 500)
+        self.fin.record_agent_entry("Revenue Tracking", "revenue", 900)
+        out = self._out("finance")
+        self.assertIn("Confirmed (Owner)", out)
+        self.assertIn("500.00", out)
+        self.assertIn("Agent estimates (NOT confirmed)", out)
+        self.assertIn("Forecasts (NOT results)", out)
+
+    def test_cli_revenue_and_expense_roundtrip(self):
+        self._out("finance revenue 1250.50 shop sales")
+        self._out("finance expense 300 shop tools")
+        self.assertEqual(self.fin.revenue_cents(business="shop"), 125050)
+        self.assertEqual(self.fin.expense_cents(business="shop"), 30000)
+        self.assertEqual(self.fin.operating_profit_cents(business="shop"),
+                         95050)
+        out = self._out("finance transactions")        self.assertIn("revenue", out)
+        self.assertIn("[owner]", out)
+
+    def test_cli_opening_balance(self):
+        self._out("finance opening 10000")
+        self.assertEqual(self.fin.revenue_cents(), 0)
+        self.assertEqual(self.fin.cash_position_cents(), 1000000)
+
+    def test_cli_forecast_kept_separate_from_actuals(self):
+        self._out("finance forecast revenue 5000 2026-12 shop")
+        self._out("finance revenue 2000")
+        self.assertEqual(len(self.fin.forecasts_all()), 1)
+        f = self.fin.forecasts_all()[0]
+        self.assertEqual(f["direction"], "revenue")
+        self.assertEqual(f["period"], "2026-12")
+        self.assertEqual(f["business"], "shop")
+        self.assertEqual(f["amount_cents"], 500000)
+        # the forecast is not in the confirmed figures
+        self.assertEqual(self.fin.revenue_cents(), 200000)
+        out = self._out("finance forecasts")
+        self.assertIn("2026-12", out)
+        self.assertIn("revenue", out)
+
+    def test_forecast_vs_actual_comparison(self):
+        self._out("finance forecast revenue 5000 2026-11")
+        self._out("finance revenue 4200")
+        cmp = self.fin.forecast_vs_actual("2026-11")
+        self.assertEqual(len(cmp["forecasts"]), 1)
+        self.assertEqual(cmp["actual_revenue_cents"], 420000)
+        self.assertEqual(cmp["actual_expense_cents"], 0)
+
+    def test_cli_kpi_snapshot_with_unit(self):
+        self._out("finance kpi visitors 12345 count")
+        rows = self.fin.kpis_all()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["name"], "visitors")
+        self.assertAlmostEqual(rows[0]["value"], 12345.0)
+        self.assertEqual(rows[0]["unit"], "count")
+        self.assertEqual(rows[0]["source"], "owner")
+
+    def test_cli_bad_inputs_do_not_crash(self):
+        for line in ("finance", "finance revenue", "finance revenue abc",
+                     "finance forecast revenue 100 2026-13",
+                     "finance forecast revenue abc 2026-12",
+                     "finance kpi visitors abc",
+                     "finance bogus subcommand", "finance transactions x"):
+            out = self._out(line)  # must not raise
+        self.assertEqual(self.fin.transactions_count(), 0)
+
+    def test_ceo_report_separates_finance_from_simulation(self):
+        self.fin.record_owner_entry(self.session, "revenue", 400)
+        self.fin.record_agent_entry("Revenue Tracking", "revenue", 77)
+        self.rt.activate_department("Betting Department")
+        report = self.rt.ceo.daily_report()
+        self.assertIn("Finance (Owner-confirmed)", report)
+        self.assertIn("400.00", report)
+        self.assertIn("NOT confirmed", report)
+        self.assertIn("not business performance", report.lower())
+
+    def test_finance_department_metrics_are_labelled(self):
+        metrics = self.rt._generate_metrics("Finance Department")
+        self.assertIn("Data provenance", metrics)
+        self.assertIn("not recorded results",
+                      metrics["Data provenance"])
+        # other departments keep their example metrics untouched
+        self.assertNotIn("Data provenance",
+                         self.rt._generate_metrics("Marketing Department"))
 
 
 if __name__ == "__main__":
