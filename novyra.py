@@ -42,6 +42,50 @@ Changelog 0.3.0-dev (Phase 0, from 0.2.2)
   with [owner] or [model]; the Betting Manager report and the CEO
   daily report show the split.
 
+Changelog 0.3.0-dev (Phase 2, Finance & KPI)
+--------------------------------------------
+* Financial ledger: a transactions table storing integer cents
+  (never binary floats), with kinds revenue, expense and
+  opening_balance. Opening capital is its own kind and is never
+  counted as revenue; operating profit, cash flow and available
+  cash are calculated and reported separately.
+* Provenance enforcement by code path, not by user-supplied flags:
+  only the Owner CLI path (guarded by an OwnerSession capability
+  token that no agent can obtain, plus an interactive approval)
+  can book owner-confirmed entries; the agent path hard-codes
+  source='estimate' and records the actual acting agent. There is
+  no 'simulated' source in the ledger at all: simulated betting and
+  trading results stay in their own ledgers and are only ever
+  quoted with an explicit "not business performance" label.
+* Append-only integrity: SQLite triggers and a connection authorizer
+  abort any UPDATE or DELETE on transactions, forecasts, kpis and
+  task_events. Corrections are new offsetting entries. The only
+  destructive path is the Owner-approved reset, which runs inside
+  one transaction, releases the protection lock only for its
+  duration and always restores it (and the triggers), even on
+  failure.
+* Forecasts: a separate table with direction, business, amount,
+  currency, period and creation date, always displayed separately
+  from confirmed actuals so they can be compared, never merged.
+* KPIs: task completion and verified-completion rates are computed
+  from an append-only task_events table (period assignment by event
+  timestamp; re-completions counted once per task via DISTINCT,
+  completion events reported separately; the denominator is the set
+  of tasks open at some point in the period, so the rate cannot
+  exceed 100%). Verification evidence is snapshotted into the
+  completion event, so historical KPIs never change when a task's
+  current verification fields are edited later. Owner-entered
+  external KPIs (visitors, rates, counts) are stored as general
+  numeric values with a unit label; monetary KPIs are never stored,
+  only computed from the ledger in cents.
+* EUR-only accounting in this version: unsupported currencies are
+  rejected, never silently combined; the per-row currency column is
+  the seam for future multi-currency support.
+* Limits of identity, documented honestly: Novyra is a single-user
+  terminal application with no cryptographic authentication. Owner
+  provenance rests on the capability token (unreachable from agent
+  code paths), the interactive approval prompt and the audit trail.
+
 Changelog 0.3.0-dev (Phase 1, CEO core)
 ---------------------------------------
 * Strategic goals: a persistent goals table (title, business
@@ -366,6 +410,38 @@ CREATE TABLE IF NOT EXISTS goals (
     status TEXT NOT NULL DEFAULT 'active',
     success_criteria TEXT NOT NULL DEFAULT '', target_date TEXT,
     created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS task_events (
+    eid INTEGER PRIMARY KEY AUTOINCREMENT,
+    tid INTEGER NOT NULL, ts TEXT NOT NULL,
+    event TEXT NOT NULL CHECK (event IN ('created', 'status_change',
+        'report', 'history', 'verification_update')),
+    from_status TEXT, to_status TEXT,
+    actor TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS transactions (
+    txid INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('revenue', 'expense',
+        'opening_balance')),
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    currency TEXT NOT NULL DEFAULT 'EUR',
+    category TEXT NOT NULL DEFAULT 'general',
+    business TEXT NOT NULL DEFAULT 'company',
+    agent TEXT, source TEXT NOT NULL DEFAULT 'owner'
+        CHECK (source IN ('owner', 'estimate', 'forecast')),
+    note TEXT NOT NULL DEFAULT '', related_task INTEGER,
+    created_by TEXT NOT NULL, created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS forecasts (
+    fid INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('revenue', 'expense')),
+    business TEXT NOT NULL DEFAULT 'company',
+    amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+    currency TEXT NOT NULL DEFAULT 'EUR', period TEXT NOT NULL,
+    created_by TEXT NOT NULL, note TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS kpis (
+    kid INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+    scope TEXT NOT NULL, target TEXT NOT NULL, name TEXT NOT NULL,
+    value REAL, unit TEXT NOT NULL DEFAULT '', display TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'owner',
+    period TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
     agent TEXT NOT NULL, question TEXT NOT NULL,
@@ -394,8 +470,47 @@ CREATE TABLE IF NOT EXISTS actions (
     allowed INTEGER NOT NULL DEFAULT 1 CHECK (allowed IN (0, 1)));
 """
 
-TABLES = ("kv", "log", "memory", "tasks", "goals", "decisions",
+TABLES = ("kv", "log", "memory", "tasks", "task_events", "goals",
+          "transactions", "forecasts", "kpis", "decisions",
           "approvals", "bets", "messages", "actions")
+
+# Phase 2: append-only financial and history tables, protected by
+# SQLite triggers and the connection authorizer (see Database).
+PROTECTED_TABLES = ("transactions", "forecasts", "kpis", "task_events")
+
+PROTECTED_TRIGGER_NAMES = tuple(
+    "%s_no_%s" % (t, op)
+    for t in PROTECTED_TABLES for op in ("update", "delete"))
+
+PROTECTION_TRIGGER_STATEMENTS = tuple(
+    "CREATE TRIGGER IF NOT EXISTS %s BEFORE %s ON %s "
+    "BEGIN SELECT RAISE(ABORT, '%s are append-only'); END;"
+    % (name, op, table, table)
+    for table in PROTECTED_TABLES
+    for op, name in (("UPDATE", "%s_no_update" % table),
+                     ("DELETE", "%s_no_delete" % table)))
+
+# executed at every database open; executed statement-by-statement
+# (never executescript) inside the reset transaction, because
+# executescript would implicitly commit and break atomicity
+PROTECTION_TRIGGER_SQL = "\n".join(PROTECTION_TRIGGER_STATEMENTS)
+
+# Phase 2: EUR-only accounting in this version. Unsupported
+# currencies are rejected, never silently combined.
+SUPPORTED_CURRENCIES = ("EUR",)
+
+TASK_EVENT_KINDS = ("created", "status_change", "report", "history",
+                    "verification_update")
+
+# sqlite3 authorizer action codes; when the running Python lacks the
+# constants (they were added in 3.11) the corresponding check is
+# skipped and the triggers remain the enforcement layer.
+_SQLITE_OK = getattr(sqlite3, "SQLITE_OK", 0)
+_SQLITE_DENY = getattr(sqlite3, "SQLITE_DENY", 1)
+_SQLITE_UPDATE = getattr(sqlite3, "SQLITE_UPDATE", None)
+_SQLITE_DELETE = getattr(sqlite3, "SQLITE_DELETE", None)
+_SQLITE_DROP_TRIGGER = getattr(sqlite3, "SQLITE_DROP_TRIGGER", None)
+_SQLITE_DROP_TABLE = getattr(sqlite3, "SQLITE_DROP_TABLE", None)
 
 # Phase 1 columns added to tasks by the backward-compatible migration
 # when the database was created by 0.2.2 or earlier.
@@ -436,10 +551,15 @@ class Database:
         self.path = path
         self.closed = False
         self.conn = None
+        # Phase 2: while this lock is engaged (always, except inside
+        # the Owner-approved reset), the authorizer denies UPDATE and
+        # DELETE on the append-only financial and history tables.
+        self._financial_lock = True
         try:
             self.conn = sqlite3.connect(path)
             self.conn.row_factory = sqlite3.Row
-            self.conn.executescript(SCHEMA)
+            self.conn.set_authorizer(self._authorize)
+            self.conn.executescript(SCHEMA + "\n" + PROTECTION_TRIGGER_SQL)
             self._migrate()
             self.conn.commit()
         except sqlite3.Error as e:
@@ -451,6 +571,68 @@ class Database:
                     pass
             self.closed = True
             raise NovyraError("Cannot open database %s: %s" % (path, e))
+
+    def _authorize(self, action, arg1, arg2, dbname, source):
+        """Connection-level defence in depth behind the append-only
+        triggers: deny UPDATE/DELETE on the protected tables and any
+        drop of the protection triggers or tables while the financial
+        lock is engaged. Action codes missing from this Python are
+        simply not checked (the triggers still enforce)."""
+        if not self._financial_lock:
+            return _SQLITE_OK
+        checks = ((_SQLITE_UPDATE, arg1, PROTECTED_TABLES),
+                  (_SQLITE_DELETE, arg1, PROTECTED_TABLES),
+                  (_SQLITE_DROP_TABLE, arg1, PROTECTED_TABLES),
+                  (_SQLITE_DROP_TRIGGER, arg1, PROTECTED_TRIGGER_NAMES))
+        for code, target, protected in checks:
+            if code is not None and action == code and target in protected:
+                return _SQLITE_DENY
+        return _SQLITE_OK
+
+    def reset_protected_data(self):
+        """Controlled destructive procedure for the append-only
+        financial and history tables. Only the Owner-approved reset
+        flow may call it. The authorizer lock is released only for
+        the duration; every drop, delete and trigger recreation
+        happens in one transaction, so a failure rolls the database
+        back completely; the lock is restored in the finally block
+        even when the wipe raises."""
+        self._financial_lock = False
+        try:
+            try:
+                # explicit transaction control: Python's legacy
+                # autocommit would commit DDL statements (the trigger
+                # drops) one by one, so the atomicity guarantee needs
+                # an explicit BEGIN/COMMIT/ROLLBACK here
+                self.conn.execute("BEGIN IMMEDIATE")
+                for name in PROTECTED_TRIGGER_NAMES:
+                    self.conn.execute("DROP TRIGGER IF EXISTS %s" % name)
+                for table in PROTECTED_TABLES:
+                    self.conn.execute("DELETE FROM %s" % table)
+                for stmt in PROTECTION_TRIGGER_STATEMENTS:
+                    self.conn.execute(stmt)
+                self.conn.execute("COMMIT")
+            except BaseException:
+                # roll back the whole procedure (drops, deletes and
+                # creations) BEFORE the lock is restored, then re-raise
+                try:
+                    self.conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+        finally:
+            self._financial_lock = True
+
+    def reset_data(self):
+        """Wipe all operational tables (protected append-only tables
+        via the controlled procedure, then the ordinary tables). The
+        approvals table is deliberately kept: the Owner's approval
+        that authorised this reset must remain on file for audit.
+        The kv store and the audit entries are the caller's concern."""
+        self.reset_protected_data()
+        for table in ("tasks", "goals", "bets", "memory", "decisions",
+                      "log", "messages", "actions"):
+            self.wipe_table(table)
 
     def _migrate(self):
         """Phase 1 backward-compatible migration: add the new tasks
@@ -627,18 +809,52 @@ class Database:
             "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
             (title, owner, dept, priority, self._ts(), goal_id, deadline,
              cost_estimate, expected_impact, risk_level, success_criteria))
+        self.conn.execute(
+            "INSERT INTO task_events (tid, ts, event, from_status, "
+            "to_status, actor, detail) VALUES (?, ?, 'created', NULL, "
+            "'pending', ?, ?)",
+            (cur.lastrowid, self._ts(), owner, title[:100]))
         self.conn.commit()
         return cur.lastrowid
 
-    def task_set_status(self, tid, status, note=""):
+    def _task_event(self, tid, event, from_status, to_status, actor,
+                    detail=""):
+        self.conn.execute(
+            "INSERT INTO task_events (tid, ts, event, from_status, "
+            "to_status, actor, detail) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tid, self._ts(), event, from_status, to_status, actor,
+             detail))
+
+    def task_set_status(self, tid, status, note="", actor="system",
+                        event_detail=""):
         if status not in TASK_STATUSES:
             raise NovyraError("Unknown task status '%s'" % status)
+        previous = self.task_get(tid)["status"]
         cur = self.conn.execute(
             "UPDATE tasks SET status = ?, note = ? WHERE tid = ?",
             (status, note, tid))
-        self.conn.commit()
         if cur.rowcount == 0:
+            self.conn.commit()
             raise NovyraError("Unknown task id T%03d" % tid)
+        self._task_event(tid, "status_change", previous, status, actor,
+                         event_detail)
+        self.conn.commit()
+
+    def task_update_verification(self, tid, verified_result, verification,
+                                 actor):
+        """Amend a task's current verification fields. The change is
+        itself appended as a 'verification_update' event, so the
+        timeline stays complete; historical KPIs keep using the
+        snapshot taken at completion time."""
+        self.task_get(tid)
+        self.conn.execute(
+            "UPDATE tasks SET verified_result = ?, verification = ? "
+            "WHERE tid = ?", (verified_result, verification, tid))
+        self._task_event(tid, "verification_update", None, None, actor,
+                         "verified_result=%s; verification=%s"
+                         % (str(verified_result)[:200],
+                            str(verification)[:100]))
+        self.conn.commit()
 
     def task_get(self, tid):
         row = self.conn.execute("SELECT * FROM tasks WHERE tid = ?",
@@ -647,26 +863,124 @@ class Database:
             raise NovyraError("Unknown task id T%03d" % tid)
         return row
 
-    def task_history_append(self, tid, entry):
+    def task_history_append(self, tid, entry, actor="system"):
         """Append a timestamped line to the task's execution history
-        (the append-only record the CEO verifies against)."""
+        (the append-only record the CEO verifies against). Every
+        append is also an immutable task_event."""
         t = self.task_get(tid)
         line = "[%s] %s" % (self._ts(), entry)
         history = (t["history"] + "\n" if t["history"] else "") + line
+        self._task_event(tid, "history", t["status"], t["status"], actor,
+                         entry[:200])
         self.conn.execute("UPDATE tasks SET history = ? WHERE tid = ?",
                           (history, tid))
         self.conn.commit()
 
-    def task_report(self, tid, report):
+    def task_report(self, tid, report, actor="agent"):
         """An agent submits its result for a task: the report goes into
         the history and the task moves to 'verifying'. Only the CEO
         review cycle may then mark it done, using this report as the
         verified result."""
         if not report or not report.strip():
             raise NovyraError("An empty result cannot be submitted")
-        self.task_history_append(tid, "result submitted: %s"
-                                 % report.strip()[:200])
-        self.task_set_status(tid, "verifying", "result submitted")
+        t = self.task_get(tid)
+        line = "[%s] result submitted: %s" % (self._ts(),
+                                              report.strip()[:200])
+        history = (t["history"] + "\n" if t["history"] else "") + line
+        self._task_event(tid, "report", t["status"], t["status"], actor,
+                         report.strip()[:200])
+        self.conn.execute("UPDATE tasks SET history = ? WHERE tid = ?",
+                          (history, tid))
+        self.conn.commit()
+        self.task_set_status(tid, "verifying", "result submitted",
+                             actor=actor)
+
+    def task_event_rows(self, tid=None):
+        if tid is None:
+            return self.conn.execute(
+                "SELECT * FROM task_events ORDER BY eid").fetchall()
+        return self.conn.execute(
+            "SELECT * FROM task_events WHERE tid = ? ORDER BY eid",
+            (tid,)).fetchall()
+
+    def task_completion_kpis(self, period, today=None):
+        """Phase 2 KPI source data from the append-only event log.
+
+        period is 'YYYY-MM'. Returns:
+          completed   distinct tasks with a completion event in the
+                      period (re-completions count once)
+          eligible    tasks open at some point in the period (created
+                      no later than the period, and not already done
+                      before it started, unless reopened)
+          events      raw completion events in the period (including
+                      re-completions; reported separately, never used
+                      as the rate numerator or denominator)
+          unattributed  tasks already 'done' with no event history
+                        (pre-Phase 2 completions), never back-dated
+        The completed set is a subset of eligible by construction, so
+        completion rate = completed / eligible can never exceed 100%.
+        """
+        start = period + "-01"
+        end = period + "-99"  # lexicographic upper bound for the month
+        tasks = {t["tid"]: t for t in self.tasks_all()}
+        events = {}
+        for e in self.task_event_rows():
+            events.setdefault(e["tid"], []).append(e)
+        completed, eligible, event_count = set(), set(), 0
+        for tid, t in tasks.items():
+            evs = sorted(events.get(tid, []), key=lambda e: e["eid"])
+            done_events = [e for e in evs
+                           if e["event"] == "status_change"
+                           and e["to_status"] == "done"]
+            in_period = [e for e in done_events
+                         if start <= e["ts"][:10] <= end]
+            if in_period:
+                completed.add(tid)
+                event_count += len(in_period)
+            # open at some point in the period?
+            # status just before the period, plus any in-period
+            # transition back to an open status (a reopen): both make
+            # the task "open at some point in the period"
+            status_before = "pending"
+            reopened_in_period = False
+            has_history = bool(evs)
+            for e in evs:
+                day = e["ts"][:10]
+                if day < start:
+                    if e["event"] == "status_change":
+                        status_before = e["to_status"]
+                elif (day <= end and e["event"] == "status_change"
+                        and e["to_status"] != "done"):
+                    reopened_in_period = True
+            created_in_or_before = t["created"][:7] <= period
+            if not has_history and t["status"] == "done":
+                continue  # pre-Phase 2 completion: unattributed bucket
+            if (created_in_or_before
+                    and (in_period or status_before != "done"
+                         or reopened_in_period)):
+                eligible.add(tid)
+        unattributed = [tid for tid, t in tasks.items()
+                        if t["status"] == "done"
+                        and not events.get(tid)]
+        return {"completed": completed, "eligible": eligible,
+                "events": event_count, "unattributed": unattributed}
+
+    def verified_completion_count(self, period):
+        """Tasks completed in the period whose completion event
+        carries a verification snapshot taken at completion time.
+        Reads only the immutable events, never the task's current
+        verification fields, so later edits cannot rewrite history."""
+        k = self.task_completion_kpis(period)
+        n = 0
+        for tid in k["completed"]:
+            for e in self.task_event_rows(tid):
+                if (e["event"] == "status_change"
+                        and e["to_status"] == "done"
+                        and e["ts"][:7] == period
+                        and e["detail"].startswith("verified=yes")):
+                    n += 1
+                    break
+        return n
 
     def tasks_overdue(self, today=None):
         """Open tasks whose deadline has passed (date prefix compare,
@@ -683,8 +997,7 @@ class Database:
     def task_stats(self, dept=None):
         if dept:
             rows = self.conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks WHERE dept = ? "
-                "GROUP BY status", (dept,)).fetchall()
+                "SELECT status, COUNT(*) AS n FROM tasks WHERE dept = ? "                "GROUP BY status", (dept,)).fetchall()
         else:
             rows = self.conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status") \
@@ -898,6 +1211,7 @@ def kelly_fraction(p, odds):
 
 class BettingBook:
     """The betting department's bankroll and bet ledger.
+
     Stakes are deducted from the bankroll at placement time, and the
     money write and the bet write happen in one atomic SQLite
     transaction: a failure can never deduct money without recording
@@ -1648,6 +1962,26 @@ class CEOAgent(Agent):
                  "verification: %d"
                  % (", ".join("%d %s" % (v, k) for k, v in st.items())
                     or "none", verified, max(unverified, 0)))
+        fin = rt.finance
+        L.append("Finance (Owner-confirmed): revenue %s, expenses %s, "
+                 "operating profit %s, cash %s, runway %s"
+                 % (money(from_cents(fin.revenue_cents())),
+                    money(from_cents(fin.expense_cents())),
+                    money(from_cents(fin.operating_profit_cents())),
+                    money(from_cents(fin.cash_position_cents())),
+                    ("%.1f months" % fin.runway())
+                    if fin.runway() is not None else "insufficient data"))
+        est = (fin.estimate_cents("revenue"), fin.estimate_cents("expense"))
+        if any(est):
+            L.append("Finance (agent estimates, NOT confirmed): "
+                     "revenue %s, expenses %s"
+                     % (money(from_cents(est[0])),
+                        money(from_cents(est[1]))))
+        if fin.forecasts_all():
+            L.append("Finance (forecasts, NOT results): %d recorded "
+                     "forecast(s) on file" % len(fin.forecasts_all()))
+        L.append("Reminder: simulated betting and trading results are "
+                 "synthetic: not business performance, not revenue.")
         for dept in DEPT_ORDER:
             mgr = rt.manager_of(dept)
             if mgr:
@@ -1662,8 +1996,7 @@ class CEOAgent(Agent):
                      "%+.2f (owner-settled %+.2f, model-settled "
                      "%+.2f), %d open positions, exposure %s"
                      % (money(book.bankroll), book.realized_pnl(),
-                        book.realized_pnl("owner"),
-                        book.realized_pnl()
+                        book.realized_pnl("owner"),                        book.realized_pnl()
                         - book.realized_pnl("owner"),
                         len(book.open_bets()), money(book.open_exposure())))
         issues = rt.guardian.monitor()
@@ -1722,7 +2055,8 @@ class CEOAgent(Agent):
             if mgr is None:
                 continue
             rt.db.task_set_status(t["tid"], "delegated",
-                                  "delegated to %s" % mgr.name)
+                                  "delegated to %s" % mgr.name,
+                                  actor=self.name)
             rt.db.decision_add(
                 self.name, "Delegate T%03d (%s)?" % (t["tid"], t["title"]),
                 "delegated to %s" % mgr.name,
@@ -1742,13 +2076,17 @@ class CEOAgent(Agent):
                 continue
             report = (t["history"] or "").strip()
             if report:
-                rt.db.task_set_status(t["tid"], "done",
-                                      "verified by CEO review")
                 rt.db.conn.execute(
                     "UPDATE tasks SET verified_result = ?, "
                     "verification = 'verified by CEO review' WHERE tid = ?",
                     (report[-400:], t["tid"]))
                 rt.db.conn.commit()
+                rt.db.task_set_status(
+                    t["tid"], "done", "verified by CEO review",
+                    actor=self.name,
+                    event_detail="verified=yes; label='verified by CEO "
+                                 "review'; evidence=%s"
+                                 % report[-200:].replace("\n", " "))
                 rt.db.decision_add(
                     self.name, "Verify T%03d (%s)?" % (t["tid"], t["title"]),
                     "done", "submitted result on file%s"
@@ -1886,6 +2224,24 @@ class GuardianAgent(Agent):
             findings.append("SUSPICIOUS: %d of %d approval requests "
                             "were denied. Review recent activity."
                             % (denied, approvals))
+        # Phase 2: the append-only protection must be in place. A
+        # missing trigger or a released authorizer lock is an
+        # integrity finding, exactly like a bankroll gap.
+        present = {r["name"] for r in db.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name IN (%s)" % ",".join("?" * len(
+                PROTECTED_TRIGGER_NAMES)),
+            PROTECTED_TRIGGER_NAMES).fetchall()}
+        missing = [n for n in PROTECTED_TRIGGER_NAMES if n not in present]
+        if missing:
+            findings.append("CRITICAL: %d append-only protection "
+                            "trigger(s) missing (%s). Financial "
+                            "records may be modifiable."
+                            % (len(missing), ", ".join(missing)))
+        if not db._financial_lock:
+            findings.append("CRITICAL: the financial authorizer lock "
+                            "is not engaged; append-only protection "
+                            "is off outside a reset.")
         blocked = rt.permissions.blocked_actions
         if blocked:
             findings.append("%d action(s) were blocked during an "
@@ -2344,6 +2700,324 @@ SPECIAL_CLASSES = {
 
 # ---------------------------------------------------------------- the runtime
 
+# ------------------------------------------------------- finance (Phase 2)
+
+class OwnerSession:
+    """Capability token for Owner-only operations.
+
+    Created only by the CLI bootstrap, held by the CLI, and never
+    handed to any agent, manager or agent-facing runtime surface.
+    Honest limitation: Novyra is a single-user terminal application
+    with no cryptographic authentication, so Owner provenance rests
+    on this token being unreachable from agent code paths, on the
+    interactive approval prompt for every owner entry, and on the
+    audit trail. A multi-user or network-exposed Novyra would need
+    real authentication in a later phase.
+    """
+
+    __slots__ = ()
+
+
+def profit_margin(profit_cents, revenue_cents):
+    """Margin as a fraction of revenue; None when there is no
+    revenue (never a division by zero, never a fake percentage)."""
+    if revenue_cents <= 0:
+        return None
+    return profit_cents / revenue_cents
+
+
+def runway_months(cash_cents, monthly_expense_cents):
+    """Runway in months from cash and average monthly owner
+    expenses; None ('insufficient data') without expense history."""
+    if monthly_expense_cents <= 0:
+        return None
+    return cash_cents / monthly_expense_cents
+
+
+class FinanceLedger:
+    """Phase 2 financial ledger. Two recording paths enforce
+    provenance by code, not by caller-supplied flags:
+
+    record_owner_entry  requires the OwnerSession capability token
+                        and an interactive Owner approval; books
+                        source='owner', created_by='Owner'.
+    record_agent_entry  hard-codes source='estimate' and records the
+                        acting agent; there is no parameter that can
+                        make an agent entry owner-confirmed.
+
+    Simulated results are not bookable at all: there is no
+    'simulated' source in the ledger. All amounts are integer cents
+    through the shared Decimal helpers. EUR-only in this version.
+    Entries are append-only (database-enforced); corrections are new
+    offsetting entries.
+    """
+
+    KINDS = ("revenue", "expense", "opening_balance")
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.db = runtime.db
+
+    # ---- recording (append-only)
+
+    def record_owner_entry(self, session, kind, amount,
+                           business="company", category="general",
+                           currency="EUR", note="", related_task=None):
+        if not isinstance(session, OwnerSession):
+            raise NovyraError(
+                "Owner authorisation is required to record a "
+                "confirmed financial entry; agents can only submit "
+                "estimates.")
+        if kind not in self.KINDS:
+            raise NovyraError("Unknown entry kind '%s'" % kind)
+        if currency not in SUPPORTED_CURRENCIES:
+            raise NovyraError(
+                "Unsupported currency '%s': this version keeps "
+                "EUR-only accounts and never mixes currencies."
+                % currency)
+        cents = to_cents(amount)
+        if cents <= 0:
+            raise NovyraError("Amount must be greater than zero")
+        detail = "%s %s (%s, %s)" % (kind, money(from_cents(cents)),
+                                     business, category)
+        if not self.runtime.permissions.request(
+                "record %s entry" % kind, detail):
+            self.db.log("Owner", "declined", "finance entry: " + detail)
+            return None
+        return self._insert(kind, cents, currency, business, category,
+                            "owner", None, note, related_task, "Owner")
+
+    def record_agent_entry(self, agent_name, kind, amount,
+                           business="company", category="general",
+                           currency="EUR", note="", related_task=None):
+        """Agent path: provenance is hard-coded to 'estimate'. There
+        is deliberately no source parameter: an agent can never mark
+        its own entry as Owner-confirmed."""
+        if kind not in self.KINDS:
+            raise NovyraError("Unknown entry kind '%s'" % kind)
+        if currency not in SUPPORTED_CURRENCIES:
+            raise NovyraError(
+                "Unsupported currency '%s': this version keeps "
+                "EUR-only accounts and never mixes currencies."
+                % currency)
+        cents = to_cents(amount)
+        if cents <= 0:
+            raise NovyraError("Amount must be greater than zero")
+        if not self.runtime.permissions.guard(
+                "record %s estimate" % kind, agent_name):
+            return None
+        txid = self._insert(kind, cents, currency, business, category,
+                            "estimate", agent_name, note, related_task,
+                            agent_name)
+        self.db.action_add(agent_name, "record %s estimate" % kind,
+                           "%s %s (%s)" % (kind, money(from_cents(cents)),
+                                           business), 1)
+        return txid
+
+    def _insert(self, kind, cents, currency, business, category, source,
+                agent, note, related_task, created_by):
+        cur = self.db.conn.execute(
+            "INSERT INTO transactions (ts, kind, amount_cents, currency, "
+            "category, business, agent, source, note, related_task, "
+            "created_by, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?)",
+            (self.db._ts(), kind, cents, currency, category, business,
+             agent, source, note, related_task, created_by,
+             self.db._ts()))
+        self.db.conn.commit()
+        self.db.log(created_by, "finance entry",
+                    "%s %s cents=%d (%s/%s, source=%s)"
+                    % (kind, currency, cents, business, category, source))
+        return cur.lastrowid
+
+    def record_offsetting_correction(self, session, txid, note=""):
+        """Corrections are new offsetting entries; historical rows are
+        immutable, so the audit trail always shows the full story."""
+        row = self.db.conn.execute(
+            "SELECT * FROM transactions WHERE txid = ?", (txid,)) \
+            .fetchone()
+        if row is None:
+            raise NovyraError("Unknown transaction #%d" % txid)
+        reverse = {"revenue": "expense", "expense": "revenue",
+                   "opening_balance": None}[row["kind"]]
+        if reverse is None:
+            raise NovyraError(
+                "An opening balance is corrected by recording the "
+                "correct opening balance, not by offsetting.")
+        return self.record_owner_entry(
+            session, reverse, from_cents(row["amount_cents"]),
+            business=row["business"], category=row["category"],
+            currency=row["currency"],
+            note="correction of #%d%s" % (txid,
+                                          (": " + note) if note else ""))
+
+    def record_forecast(self, session, direction, amount, period,
+                        business="company", currency="EUR", note=""):
+        if direction not in ("revenue", "expense"):
+            raise NovyraError("Forecast direction must be revenue or "
+                              "expense")
+        if currency not in SUPPORTED_CURRENCIES:
+            raise NovyraError("Unsupported currency '%s'" % currency)
+        cents = to_cents(amount)
+        if cents <= 0:
+            raise NovyraError("Amount must be greater than zero")
+        if not period or not isinstance(period, str) or len(period) != 7:
+            raise NovyraError("Forecast period must be 'YYYY-MM'")
+        try:
+            month = int(period[5:7])
+        except ValueError:
+            month = 0
+        if not (1 <= month <= 12):
+            raise NovyraError("Forecast period must be 'YYYY-MM' with a "
+                              "valid month, e.g. '2026-12'")
+        if not self.runtime.permissions.request(
+                "record forecast",
+                "%s %s for %s (%s)" % (direction,
+                                       money(from_cents(cents)),
+                                       period, business)):
+            return None
+        cur = self.db.conn.execute(
+            "INSERT INTO forecasts (ts, direction, business, "
+            "amount_cents, currency, period, created_by, note) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'Owner', ?)",
+            (self.db._ts(), direction, business, cents, currency,
+             period, note))
+        self.db.conn.commit()
+        self.db.log("Owner", "forecast",
+                    "%s %s cents=%d period=%s" % (direction, currency,
+                                                  cents, period))
+        return cur.lastrowid
+
+    def record_kpi(self, session, name, value, unit="", scope="company",
+                   target="company", period=""):
+        """Owner-entered external KPI snapshot (visitors, rates,
+        counts). General numeric values with a unit label; monetary
+        KPIs are never stored, only computed from the ledger."""
+        if not isinstance(session, OwnerSession):
+            raise NovyraError("Owner authorisation is required to "
+                              "record a KPI snapshot.")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise NovyraError("KPI value must be a number")
+        if not self.runtime.permissions.request(
+                "record KPI snapshot", "%s = %s %s" % (name, value,
+                                                       unit)):
+            return None
+        cur = self.db.conn.execute(
+            "INSERT INTO kpis (ts, scope, target, name, value, unit, "
+            "display, source, period) VALUES (?, ?, ?, ?, ?, ?, ?, "
+            "'owner', ?)",
+            (self.db._ts(), scope, target, name, value, unit,
+             ("%s %s" % (value, unit)).strip(), period))
+        self.db.conn.commit()
+        self.db.log("Owner", "kpi snapshot", "%s = %s %s"
+                    % (name, value, unit))
+        return cur.lastrowid
+
+    # ---- confirmed figures (owner source only, cents)
+
+    def _sum_cents(self, kind, period=None, business=None):
+        q = ("SELECT COALESCE(SUM(amount_cents), 0) AS s FROM "
+             "transactions WHERE kind = ? AND source = 'owner'")
+        params = [kind]
+        if period:
+            q += " AND substr(ts, 1, 7) = ?"
+            params.append(period)
+        if business:
+            q += " AND business = ?"
+            params.append(business)
+        return self.db.conn.execute(q, params).fetchone()["s"]
+
+    def revenue_cents(self, period=None, business=None):
+        # opening balances are never revenue
+        return self._sum_cents("revenue", period, business)
+
+    def expense_cents(self, period=None, business=None):
+        return self._sum_cents("expense", period, business)
+
+    def opening_balance_cents(self):
+        return self._sum_cents("opening_balance")
+
+    def operating_profit_cents(self, period=None, business=None):
+        return (self.revenue_cents(period, business)
+                - self.expense_cents(period, business))
+
+    def cash_position_cents(self):
+        """Available cash: opening balances + confirmed revenue
+        - confirmed expenses. Never includes the betting bankroll,
+        estimates or forecasts."""
+        return (self.opening_balance_cents()
+                + self.operating_profit_cents())
+
+    def cash_flow_cents(self, period=None, business=None):
+        """Operating cash flow for a period: excludes opening
+        balances, which are capital, not earnings."""
+        return self.operating_profit_cents(period, business)
+
+    def runway(self):
+        """Runway in months from confirmed figures, or None when
+        there is no confirmed expense history yet."""
+        row = self.db.conn.execute(
+            "SELECT substr(ts, 1, 7) AS m, "
+            "SUM(amount_cents) AS s FROM transactions "
+            "WHERE kind = 'expense' AND source = 'owner' "
+            "GROUP BY m").fetchall()
+        if not row:
+            return None
+        avg = sum(r["s"] for r in row) / len(row)
+        return runway_months(self.cash_position_cents(), avg)
+
+    def by_category(self, kind, period=None):
+        """Confirmed amounts per category: {category: cents}."""
+        q = ("SELECT category, SUM(amount_cents) AS s FROM transactions "
+             "WHERE kind = ? AND source = 'owner'")
+        params = [kind]
+        if period:
+            q += " AND substr(ts, 1, 7) = ?"
+            params.append(period)
+        q += " GROUP BY category"
+        return {r["category"]: r["s"]
+                for r in self.db.conn.execute(q, params).fetchall()}
+
+    # ---- non-confirmed figures (always reported separately)
+
+    def estimate_cents(self, kind, period=None):
+        q = ("SELECT COALESCE(SUM(amount_cents), 0) AS s FROM "
+             "transactions WHERE kind = ? AND source = 'estimate'")
+        params = [kind]
+        if period:
+            q += " AND substr(ts, 1, 7) = ?"
+            params.append(period)
+        return self.db.conn.execute(q, params).fetchone()["s"]
+
+    def forecasts_all(self):
+        return self.db.conn.execute(
+            "SELECT * FROM forecasts ORDER BY fid").fetchall()
+
+    def forecast_vs_actual(self, period):        """Compare recorded forecasts against confirmed actuals for
+        a period. Forecasts are never merged into actuals."""
+        rows = [f for f in self.forecasts_all() if f["period"] == period]
+        return {"forecasts": rows,
+                "actual_revenue_cents": self.revenue_cents(period),
+                "actual_expense_cents": self.expense_cents(period)}
+
+    def transactions_tail(self, n=20):
+        rows = self.db.conn.execute(
+            "SELECT * FROM transactions ORDER BY txid DESC LIMIT ?",
+            (n,)).fetchall()
+        return list(reversed(rows))
+
+    def transactions_count(self):
+        row = self.db.conn.execute(
+            "SELECT COUNT(*) AS n FROM transactions").fetchone()
+        return row["n"]
+
+    def kpis_all(self):
+        return self.db.conn.execute(
+            "SELECT * FROM kpis ORDER BY kid").fetchall()
+
+
 class Runtime:
     def __init__(self, db_path=None, demo=False):
         self._closed = False
@@ -2357,6 +3031,7 @@ class Runtime:
         self.bus = Bus(self.db)
         self.permissions = Permissions(self)
         self.book = BettingBook(self.db)
+        self.finance = FinanceLedger(self)
         if self.db.kv_get("sim_autonomy") is None:
             self.db.kv_set("sim_autonomy", "0")
         self.agents = {}
@@ -2514,7 +3189,13 @@ class Runtime:
                     "Portfolio exposure": money(r(4000, 12000)),
                     "Win rate": pct(r(0.42, 0.58))}
         if dept == "Finance Department":
-            return {"Revenue (30d)": money(r(15000, 26000)),
+            # Phase 2: these are simulated example figures for the
+            # demo flavour of the blueprint. They are labelled as
+            # such at the source so they can never be mistaken for
+            # the confirmed ledger figures the CEO reports.
+            return {"Data provenance": "simulated example figures, "
+                                       "not recorded results",
+                    "Revenue (30d)": money(r(15000, 26000)),
                     "Expenses (30d)": money(r(9000, 14000)),
                     "Cash on hand": money(r(30000, 60000)),
                     "Runway (months)": r(7, 18)}
@@ -2677,9 +3358,11 @@ class Runtime:
         return ans in ("y", "yes")
 
     def reset_data(self):
-        for table in ("tasks", "goals", "bets", "memory", "decisions",
-                      "approvals", "log", "messages", "actions"):
-            self.db.wipe_table(table)
+        """Owner-approved wipe of all operational data. The database
+        layer resets the protected append-only tables and the ordinary
+        tables; the runtime layer then restores the kv defaults and
+        writes the audit entries."""
+        self.db.reset_data()
         self.db.kv_set("bankroll", "%.2f" % INITIAL_BANKROLL)
         self.db.kv_set("bankroll_initial", "%.2f" % INITIAL_BANKROLL)
         self.db.kv_set("scans", "0")
@@ -2695,6 +3378,7 @@ class Runtime:
         row = self.db.conn.execute(
             "SELECT MAX(id) AS m FROM log").fetchone()
         self.db.kv_set("watchdog_cursor", str(row["m"] or 0))
+
 
 # --------------------------------------------------------------------- CLI
 
@@ -2712,6 +3396,14 @@ Commands:
   goals                         strategic goals
   goal <title> [| obj | crit | date]  create a strategic goal
   review                        CEO review cycle (delegate, verify, escalate)
+  finance                       finance summary (confirmed vs estimates
+                                vs forecasts vs simulation)
+  finance revenue|expense|opening <amount> [business] [category]
+                                book a confirmed entry (approval)
+  finance forecast <rev|exp> <amount> <YYYY-MM>
+                                store a forecast (kept separate)
+  finance kpi <name> <value> [unit]   KPI snapshot (approval)
+  finance transactions [n]      append-only ledger tail
   bets                          bet ledger with PnL
   settle <id> <home|draw|away>  settle an open bet (approval)
   autonomy <on|off>             autonomous simulated betting (approval)
@@ -2744,6 +3436,9 @@ def print_block(agent_name, text, color=C.CYAN):
 class CLI:
     def __init__(self, runtime):
         self.rt = runtime
+        # the capability token for Owner-only operations lives here,
+        # on the CLI, where Owner input arrives; agents never see it
+        self.owner_session = OwnerSession()
         self.table = {
             "help": self.cmd_help, "?": self.cmd_help,
             "status": self.cmd_status,
@@ -2758,6 +3453,7 @@ class CLI:
             "goals": self.cmd_goals,
             "goal": self.cmd_goal,
             "review": self.cmd_review,
+            "finance": self.cmd_finance,
             "bets": self.cmd_bets,
             "settle": self.cmd_settle,
             "autonomy": self.cmd_autonomy,
@@ -3023,6 +3719,125 @@ class CLI:
     def cmd_review(self, rest):
         print_block("CEO Agent", self.rt.ceo.review_cycle())
 
+    def cmd_finance(self, rest):
+        """Phase 2: financial ledger and KPIs. Only this CLI path can
+        book Owner-confirmed entries (it holds the OwnerSession
+        token and asks for approval per entry)."""
+        rt = self.rt
+        fin = rt.finance
+        parts = rest.split()
+        sub = parts[0].lower() if parts else ""
+        if sub in ("revenue", "expense", "opening") and len(parts) >= 2:
+            kind = {"revenue": "revenue", "expense": "expense",
+                    "opening": "opening_balance"}[sub]
+            try:
+                amount = float(parts[1])
+            except ValueError:
+                print(wrap("Amount must be a number, e.g. "
+                           "'finance %s 1250.50'" % sub))
+                return
+            business = parts[2] if len(parts) > 2 else "company"
+            category = parts[3] if len(parts) > 3 else "general"
+            txid = fin.record_owner_entry(
+                self.owner_session, kind, amount, business=business,
+                category=category)
+            if txid is not None:
+                print(wrap("[Finance] Booked %s %s (entry #%d). "
+                           "Owner-confirmed."
+                           % (kind, money(amount), txid)))
+            return
+        if sub == "forecast" and len(parts) >= 4:
+            try:
+                amount = float(parts[2])
+            except ValueError:
+                print(wrap("Amount must be a number, e.g. "
+                           "'finance forecast revenue 5000 2026-12'"))
+                return
+            fid = fin.record_forecast(self.owner_session, parts[1].lower(),
+                                      amount, parts[3],
+                                      business=parts[4]
+                                      if len(parts) > 4 else "company")
+            if fid is not None:
+                print(wrap("[Finance] Forecast #%d stored. Forecasts are "
+                           "kept separate from confirmed results." % fid))
+            return
+        if sub == "kpi" and len(parts) >= 3:
+            try:
+                value = float(parts[2])
+            except ValueError:
+                print(wrap("KPI value must be a number, e.g. "
+                           "'finance kpi visitors 12345 count'"))
+                return
+            unit = parts[3] if len(parts) > 3 else ""
+            kid = fin.record_kpi(self.owner_session, parts[1], value,
+                                 unit=unit)
+            if kid is not None:
+                print(wrap("[Finance] KPI snapshot #%d stored." % kid))
+            return
+        if sub == "transactions":
+            hdr("TRANSACTIONS (APPEND-ONLY LEDGER)")
+            rows = fin.transactions_tail(int(parts[1]) if len(parts) > 1
+                                         and parts[1].isdigit() else 20)
+            if not rows:
+                print(wrap("No entries recorded yet."))
+                return
+            for r in rows:
+                print("  #%-4d %s %-15s %10s %-4s %-12s %-10s [%s] %s"
+                      % (r["txid"], r["ts"][:16], r["kind"],
+                         money(from_cents(r["amount_cents"])),
+                         r["currency"], r["business"], r["category"],
+                         r["source"], r["note"][:30]))
+            return
+        if sub == "forecasts":
+            hdr("FORECASTS (SEPARATE FROM ACTUALS)")
+            rows = fin.forecasts_all()
+            if not rows:
+                print(wrap("No forecasts recorded."))
+                return
+            for f in rows:
+                print("  #%-4d %s %-15s %10s %-7s (created %s)"
+                      % (f["fid"], f["direction"], f["period"],
+                         money(from_cents(f["amount_cents"])),
+                         f["business"], f["ts"][:16]))
+            return
+        # summary
+        hdr("FINANCE SUMMARY")
+        rev = fin.revenue_cents()
+        exp = fin.expense_cents()
+        profit = rev - exp
+        print(wrap("Confirmed (Owner): revenue %s, expenses %s, "
+                   "operating profit %s"
+                   % (money(from_cents(rev)), money(from_cents(exp)),
+                      money(from_cents(profit)))))
+        print(wrap("Confirmed (Owner): cash position %s, cash flow "
+                   "(this month) %s, runway %s"
+                   % (money(from_cents(fin.cash_position_cents())),
+                      money(from_cents(fin.cash_flow_cents(
+                          now_str()[:7]))),
+                      ("%.1f months" % fin.runway())
+                      if fin.runway() is not None
+                      else "insufficient data")))
+        est_rev = fin.estimate_cents("revenue")
+        est_exp = fin.estimate_cents("expense")
+        print(wrap("Agent estimates (NOT confirmed): revenue %s, "
+                   "expenses %s"
+                   % (money(from_cents(est_rev)),
+                      money(from_cents(est_exp))), "  " + C.DIM))
+        print(wrap("Forecasts (NOT results): %d on file; compare with "
+                   "'finance forecasts'"
+                   % len(fin.forecasts_all()), "  " + C.DIM))
+        if rt.dept_active("Betting Department"):
+            book = rt.book
+            print(wrap("Simulation (NOT business performance): betting "
+                       "PnL %+.2f on a simulated bankroll; simulated "
+                       "results are never revenue."
+                       % book.realized_pnl(), "  " + C.YELLOW))
+        print(wrap("Use: finance revenue|expense|opening <amount> "
+                   "[business] [category], finance forecast "
+                   "<revenue|expense> <amount> <YYYY-MM>, finance kpi "
+                   "<name> <value> [unit], finance transactions [n]",
+                   "  " + C.DIM))
+
     def cmd_bets(self, rest):
         rt = self.rt
         hdr("BET LEDGER (SIMULATION)")
@@ -3180,7 +3995,6 @@ class CLI:
             return
         reply = hit.act(parts[1].strip())
         print_block(hit.name, reply)
-
     def cmd_guardian(self, rest):
         rt = self.rt
         hdr("GUARDIAN INTEGRITY SCAN")
@@ -3268,10 +4082,15 @@ class CLI:
         roster = json.loads(rt.db.kv_get("agents_json", "[]"))
         print(wrap("Agents: %d active in this session, %d on the persisted "
                    "roster" % (len(rt.agents), len(roster))))
-        print(wrap("Rows: %d tasks, %d goals, %d bets, %d memory notes, "
-                   "%d decisions, %d approvals, %d messages, %d watched "
-                   "actions, %d log entries"
+        print(wrap("Rows: %d tasks, %d goals, %d transactions, %d "
+                   "forecasts, %d kpi snapshots, %d task events, %d "
+                   "bets, %d memory notes, %d decisions, %d approvals, "
+                   "%d messages, %d watched actions, %d log entries"
                    % (len(rt.db.tasks_all()), len(rt.db.goals_all()),
+                      len(rt.finance.transactions_count()),
+                      len(rt.finance.forecasts_all()),
+                      len(rt.finance.kpis_all()),
+                      len(rt.db.task_event_rows()),
                       len(rt.db.bets_all()),
                       rt.db.memory_count_all(),
                       len(rt.db.decisions_all()),
@@ -3282,8 +4101,9 @@ class CLI:
         rt = self.rt
         if not rt.permissions.request(
                 "reset operational data",
-                "wipe tasks, bets, memories, decisions, approvals, "
-                "messages, actions and logs; the agent roster stays"):
+                "wipe tasks, bets, memories, decisions, "
+                "messages, actions and logs; approvals stay on file "
+                "for audit and the agent roster stays"):
             print(wrap("Declined. Nothing was deleted."))
             return
         rt.reset_data()
