@@ -997,7 +997,8 @@ class TestAggregateExposure(NovyraCase):
         self._fill_with_four_max_bets()
         self._place(132.78)
         self.assertEqual(len(self.book.open_bets()), 5)
-        self.assertAlmostEqual(self.book.open_exposure(), 909.09)        self.assertAlmostEqual(self.book.bankroll, 9090.91)
+        self.assertAlmostEqual(self.book.open_exposure(), 909.09)
+        self.assertAlmostEqual(self.book.bankroll, 9090.91)
         # one cent more is refused and audited
         with self.assertRaises(N.BettingError) as cm:
             self._place(132.79)
