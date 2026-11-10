@@ -997,7 +997,8 @@ class Permissions:
 
     Every sensitive action goes through request(), which records an
     approval or denial row. The emergency stop is persisted, so a
-    restart does not silently re-enable halted agents, and resume also    requires Owner approval.
+    restart does not silently re-enable halted agents, and resume also
+    requires Owner approval.
     """
 
     def __init__(self, runtime):
@@ -1996,7 +1997,8 @@ SPECIAL_CLASSES = {
     ("Betting Department", "Data Quality"): DataQuality,
     ("Betting Department", "Market Intelligence"): MarketIntelligence,
     ("Betting Department", "Opportunity Scanner"): OpportunityScanner,
-    ("Betting Department", "Prediction Engine"): PredictionEngine,    ("Betting Department", "Value Finder"): ValueFinder,
+    ("Betting Department", "Prediction Engine"): PredictionEngine,
+    ("Betting Department", "Value Finder"): ValueFinder,
     ("Betting Department", "Confidence"): Confidence,
     ("Betting Department", "Risk Manager"): BettingRiskManager,
     ("Betting Department", "Portfolio Manager"): BettingPortfolioManager,
