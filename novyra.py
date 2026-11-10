@@ -42,6 +42,40 @@ Changelog 0.3.0-dev (Phase 0, from 0.2.2)
   with [owner] or [model]; the Betting Manager report and the CEO
   daily report show the split.
 
+Changelog 0.3.0-dev (Phase 1, CEO core)
+---------------------------------------
+* Strategic goals: a persistent goals table (title, business
+  objective, status, success criteria, target date). The Owner
+  creates goals with the 'goal' command; the CEO reports against
+  them. Goals are wiped by 'reset' like all operational data.
+* Full task records: the tasks table gains goal_id, deadline,
+  cost_estimate, expected_impact, risk_level, success_criteria,
+  history, verified_result and verification columns. The migration
+  is backward-compatible: an existing 0.2.2 database is altered in
+  place with ALTER TABLE and keeps every existing row and value.
+  The status flow is now pending -> delegated -> in_progress ->
+  verifying -> done | failed ('pending' kept for compatibility).
+* CEO review cycle ('review' command): one bounded pass in which
+  the CEO delegates pending goal tasks to active department
+  managers, verifies tasks whose agent submitted a result (a task
+  is only marked done with the submitted report recorded as its
+  verified result; a 'verifying' task with no submitted result is
+  escalated to the Owner, never assumed done), and escalates
+  overdue work. Every delegate/verify/escalate decision is written
+  to the decisions table. The cycle is capped at
+  MAX_REVIEW_ACTIONS actions per pass so it can never loop.
+  Semantic checking of a report against its success criteria needs
+  an LLM and is left to a later phase; the deterministic CEO
+  records the evidence and never invents a verdict.
+* Owner reporting: the daily report now includes goal progress and
+  verified-vs-unverified task counts; 'tasks' shows deadline, goal
+  link and verification state.
+* Config surface (stored, not yet enforced): autonomy_threshold
+  (default 0.87), max_autonomous_spend (default 100.00 EUR) and
+  daily_autonomous_budget (unset = autonomous spending disabled).
+  These are Phase 2 knobs only; nothing in Phase 1 reads them for
+  enforcement and no autonomous spending of any kind exists.
+
 Changelog 0.2.2 (from 0.2.1)
 ----------------------------
 * Exact money math: all monetary limits are compared in integer cents
@@ -321,7 +355,17 @@ CREATE TABLE IF NOT EXISTS tasks (
     owner TEXT NOT NULL, dept TEXT NOT NULL,
     priority TEXT NOT NULL DEFAULT 'normal',
     status TEXT NOT NULL DEFAULT 'pending',
-    note TEXT NOT NULL DEFAULT '', created TEXT NOT NULL);
+    note TEXT NOT NULL DEFAULT '', created TEXT NOT NULL,
+    goal_id INTEGER, deadline TEXT, cost_estimate REAL,
+    expected_impact TEXT, risk_level TEXT DEFAULT 'normal',
+    success_criteria TEXT DEFAULT '', history TEXT DEFAULT '',
+    verified_result TEXT, verification TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS goals (
+    gid INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
+    objective TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    success_criteria TEXT NOT NULL DEFAULT '', target_date TEXT,
+    created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
     agent TEXT NOT NULL, question TEXT NOT NULL,
@@ -350,8 +394,36 @@ CREATE TABLE IF NOT EXISTS actions (
     allowed INTEGER NOT NULL DEFAULT 1 CHECK (allowed IN (0, 1)));
 """
 
-TABLES = ("kv", "log", "memory", "tasks", "decisions", "approvals",
-          "bets", "messages", "actions")
+TABLES = ("kv", "log", "memory", "tasks", "goals", "decisions",
+          "approvals", "bets", "messages", "actions")
+
+# Phase 1 columns added to tasks by the backward-compatible migration
+# when the database was created by 0.2.2 or earlier.
+TASK_MIGRATION_COLUMNS = (
+    ("goal_id", "INTEGER"),
+    ("deadline", "TEXT"),
+    ("cost_estimate", "REAL"),
+    ("expected_impact", "TEXT"),
+    ("risk_level", "TEXT DEFAULT 'normal'"),
+    ("success_criteria", "TEXT DEFAULT ''"),
+    ("history", "TEXT DEFAULT ''"),
+    ("verified_result", "TEXT"),
+    ("verification", "TEXT DEFAULT ''"),
+)
+
+TASK_STATUSES = ("pending", "delegated", "in_progress", "verifying",
+                 "done", "failed")
+GOAL_STATUSES = ("active", "paused", "achieved", "failed")
+
+# Phase 1 config knobs. Stored in the kv store under config_<key>;
+# nothing in Phase 1 enforces them (Phase 2 will). An unset
+# daily_autonomous_budget means autonomous spending stays disabled.
+CONFIG_DEFAULTS = {"autonomy_threshold": "0.87",
+                   "max_autonomous_spend": "100.00"}
+
+# Upper bound on delegate/verify/escalate actions in one CEO review
+# pass, so the cycle can never loop unbounded.
+MAX_REVIEW_ACTIONS = 10
 
 
 class Database:
@@ -368,6 +440,7 @@ class Database:
             self.conn = sqlite3.connect(path)
             self.conn.row_factory = sqlite3.Row
             self.conn.executescript(SCHEMA)
+            self._migrate()
             self.conn.commit()
         except sqlite3.Error as e:
             # never leak a half-open connection on a failed open
@@ -378,6 +451,19 @@ class Database:
                     pass
             self.closed = True
             raise NovyraError("Cannot open database %s: %s" % (path, e))
+
+    def _migrate(self):
+        """Phase 1 backward-compatible migration: add the new tasks
+        columns to a database created by 0.2.2 or earlier. ALTER TABLE
+        keeps every existing row and value; new columns take their
+        declared defaults. Fresh databases already have the columns,
+        so this is a no-op there."""
+        cols = {r["name"] for r in
+                self.conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        for name, decl in TASK_MIGRATION_COLUMNS:
+            if name not in cols:
+                self.conn.execute("ALTER TABLE tasks ADD COLUMN %s %s"
+                                  % (name, decl))
 
     def close(self):
         """Close the connection. Safe to call more than once."""
@@ -428,6 +514,45 @@ class Database:
             (key, str(value)))
         if commit:
             self.conn.commit()
+
+    # ---- config surface (Phase 1: stored only, nothing enforces it)
+
+    def config_get(self, key):
+        """Return a config value, or None when unset. An unset value
+        means the feature it gates stays disabled (for example an
+        unset daily_autonomous_budget disables autonomous spending)."""
+        if key not in CONFIG_DEFAULTS and key != "daily_autonomous_budget":
+            raise NovyraError("Unknown config key '%s'" % key)
+        value = self.kv_get("config_" + key)
+        if value is None:
+            # unset: documented default, or None for the daily budget
+            # (an unset daily budget means spending stays disabled)
+            return CONFIG_DEFAULTS.get(key)
+        return value
+
+    def config_set(self, key, value):
+        if key not in CONFIG_DEFAULTS and key != "daily_autonomous_budget":
+            raise NovyraError("Unknown config key '%s'" % key)
+        if key != "daily_autonomous_budget":
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                raise NovyraError("Config '%s' must be a number" % key)
+            if v < 0:
+                raise NovyraError("Config '%s' must not be negative" % key)
+            value = "%.2f" % v if key == "max_autonomous_spend" else str(v)
+        elif value is None or value == "":
+            # unsetting the daily budget disables autonomous spending
+            self.conn.execute("DELETE FROM kv WHERE key = ?",
+                              ("config_" + key,))
+            self.conn.commit()
+            return
+        else:
+            try:
+                value = "%.2f" % float(value)
+            except (TypeError, ValueError):
+                raise NovyraError("Config '%s' must be a number" % key)
+        self.kv_set("config_" + key, value)
 
     # ---- audit log
 
@@ -491,21 +616,65 @@ class Database:
 
     # ---- task board
 
-    def task_create(self, title, owner, dept, priority="normal"):
+    def task_create(self, title, owner, dept, priority="normal",
+                    goal_id=None, deadline=None, cost_estimate=None,
+                    expected_impact=None, risk_level="normal",
+                    success_criteria=""):
         cur = self.conn.execute(
             "INSERT INTO tasks (title, owner, dept, priority, status, "
-            "created) VALUES (?, ?, ?, ?, 'pending', ?)",
-            (title, owner, dept, priority, self._ts()))
+            "created, goal_id, deadline, cost_estimate, expected_impact, "
+            "risk_level, success_criteria) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
+            (title, owner, dept, priority, self._ts(), goal_id, deadline,
+             cost_estimate, expected_impact, risk_level, success_criteria))
         self.conn.commit()
         return cur.lastrowid
 
     def task_set_status(self, tid, status, note=""):
+        if status not in TASK_STATUSES:
+            raise NovyraError("Unknown task status '%s'" % status)
         cur = self.conn.execute(
             "UPDATE tasks SET status = ?, note = ? WHERE tid = ?",
             (status, note, tid))
         self.conn.commit()
         if cur.rowcount == 0:
             raise NovyraError("Unknown task id T%03d" % tid)
+
+    def task_get(self, tid):
+        row = self.conn.execute("SELECT * FROM tasks WHERE tid = ?",
+                                (tid,)).fetchone()
+        if row is None:
+            raise NovyraError("Unknown task id T%03d" % tid)
+        return row
+
+    def task_history_append(self, tid, entry):
+        """Append a timestamped line to the task's execution history
+        (the append-only record the CEO verifies against)."""
+        t = self.task_get(tid)
+        line = "[%s] %s" % (self._ts(), entry)
+        history = (t["history"] + "\n" if t["history"] else "") + line
+        self.conn.execute("UPDATE tasks SET history = ? WHERE tid = ?",
+                          (history, tid))
+        self.conn.commit()
+
+    def task_report(self, tid, report):
+        """An agent submits its result for a task: the report goes into
+        the history and the task moves to 'verifying'. Only the CEO
+        review cycle may then mark it done, using this report as the
+        verified result."""
+        if not report or not report.strip():
+            raise NovyraError("An empty result cannot be submitted")
+        self.task_history_append(tid, "result submitted: %s"
+                                 % report.strip()[:200])
+        self.task_set_status(tid, "verifying", "result submitted")
+
+    def tasks_overdue(self, today=None):
+        """Open tasks whose deadline has passed (date prefix compare,
+        deadlines are ISO dates)."""
+        today = today or datetime.now().strftime("%Y-%m-%d")
+        return [r for r in self.tasks_all()
+                if r["deadline"] and r["deadline"][:10] < today
+                and r["status"] not in ("done", "failed")]
 
     def tasks_all(self):
         return self.conn.execute("SELECT * FROM tasks ORDER BY tid") \
@@ -521,6 +690,46 @@ class Database:
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status") \
                 .fetchall()
         return {r["status"]: r["n"] for r in rows}
+
+    # ---- strategic goals (Phase 1)
+
+    def goal_create(self, title, objective="", success_criteria="",
+                    target_date=None):
+        cur = self.conn.execute(
+            "INSERT INTO goals (title, objective, status, "
+            "success_criteria, target_date, created) "
+            "VALUES (?, ?, 'active', ?, ?, ?)",
+            (title, objective, success_criteria, target_date, self._ts()))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def goal_get(self, gid):
+        row = self.conn.execute("SELECT * FROM goals WHERE gid = ?",
+                                (gid,)).fetchone()
+        if row is None:
+            raise NovyraError("Unknown goal id G%03d" % gid)
+        return row
+
+    def goals_all(self):
+        return self.conn.execute("SELECT * FROM goals ORDER BY gid") \
+            .fetchall()
+
+    def goal_set_status(self, gid, status):
+        if status not in GOAL_STATUSES:
+            raise NovyraError("Unknown goal status '%s'" % status)
+        cur = self.conn.execute("UPDATE goals SET status = ? WHERE gid = ?",
+                                (status, gid))
+        self.conn.commit()
+        if cur.rowcount == 0:
+            raise NovyraError("Unknown goal id G%03d" % gid)
+
+    def goal_task_counts(self):
+        counts = {}
+        for r in self.conn.execute(
+                "SELECT goal_id, COUNT(*) AS n FROM tasks "
+                "WHERE goal_id IS NOT NULL GROUP BY goal_id").fetchall():
+            counts[r["goal_id"]] = r["n"]
+        return counts
 
     # ---- decisions and approvals
 
@@ -689,7 +898,6 @@ def kelly_fraction(p, odds):
 
 class BettingBook:
     """The betting department's bankroll and bet ledger.
-
     Stakes are deducted from the bankroll at placement time, and the
     money write and the bet write happen in one atomic SQLite
     transaction: a failure can never deduct money without recording
@@ -1425,6 +1633,21 @@ class CEOAgent(Agent):
                  "%d decisions logged"
                  % (len(rt.agents), rt.blueprint_size(),
                     len(rt.db.decisions_all())))
+        goals = rt.db.goals_all()
+        if goals:
+            counts = rt.db.goal_task_counts()
+            for g in goals:
+                L.append("  - Goal G%03d [%s]: %s (%d task(s))"
+                         % (g["gid"], g["status"], g["title"],
+                            counts.get(g["gid"], 0)))
+        st = rt.db.task_stats()
+        verified = len([t for t in rt.db.tasks_all()
+                        if t["status"] == "done" and t["verified_result"]])
+        unverified = st.get("done", 0) - verified
+        L.append("Tasks: %s | verified done: %d, done without recorded "
+                 "verification: %d"
+                 % (", ".join("%d %s" % (v, k) for k, v in st.items())
+                    or "none", verified, max(unverified, 0)))
         for dept in DEPT_ORDER:
             mgr = rt.manager_of(dept)
             if mgr:
@@ -1459,12 +1682,121 @@ class CEOAgent(Agent):
                            "published", "routine reporting duty")
         return "\n".join(L)
 
+    # -------------------------------------------------- Phase 1: review
+
+    def review_cycle(self):
+        """One bounded CEO pass: delegate pending goal tasks, verify
+        submitted results, escalate overdue work.
+
+        The CEO never assumes a result: a task reaches 'done' only
+        when an agent submitted a report (task_report) and the CEO
+        records that report as the verified result. A 'verifying'
+        task with no submitted result is escalated to the Owner.
+        Semantic checking of a report against its success criteria
+        needs an LLM and is a later-phase capability; here the
+        deterministic CEO records the evidence it has.
+        """
+        rt = self.runtime
+        if rt.permissions.emergency_stop:
+            rt.db.decision_add(self.name, "Run CEO review cycle?",
+                               "blocked", "emergency stop engaged")
+            return ("Emergency stop is engaged. The review cycle is "
+                    "frozen. Use 'resume' (with your approval) first.")
+        actions = 0
+        lines = []
+
+        # 1. delegate pending tasks that belong to an active goal
+        for t in rt.db.tasks_all():
+            if actions >= MAX_REVIEW_ACTIONS:
+                lines.append("Review cap reached (%d actions); the rest "
+                             "waits for the next pass."
+                             % MAX_REVIEW_ACTIONS)
+                break
+            if t["status"] != "pending" or not t["goal_id"]:
+                continue
+            try:
+                rt.db.goal_get(t["goal_id"])
+            except NovyraError:
+                continue
+            mgr = rt.manager_of(t["dept"])
+            if mgr is None:
+                continue
+            rt.db.task_set_status(t["tid"], "delegated",
+                                  "delegated to %s" % mgr.name)
+            rt.db.decision_add(
+                self.name, "Delegate T%03d (%s)?" % (t["tid"], t["title"]),
+                "delegated to %s" % mgr.name,
+                "serves goal G%03d" % t["goal_id"])
+            lines.append("Delegated T%03d '%s' to %s."
+                         % (t["tid"], t["title"], mgr.name))
+            actions += 1
+
+        # 2. verify tasks whose agent submitted a result
+        for t in rt.db.tasks_all():
+            if actions >= MAX_REVIEW_ACTIONS:
+                lines.append("Review cap reached (%d actions); the rest "
+                             "waits for the next pass."
+                             % MAX_REVIEW_ACTIONS)
+                break
+            if t["status"] != "verifying":
+                continue
+            report = (t["history"] or "").strip()
+            if report:
+                rt.db.task_set_status(t["tid"], "done",
+                                      "verified by CEO review")
+                rt.db.conn.execute(
+                    "UPDATE tasks SET verified_result = ?, "
+                    "verification = 'verified by CEO review' WHERE tid = ?",
+                    (report[-400:], t["tid"]))
+                rt.db.conn.commit()
+                rt.db.decision_add(
+                    self.name, "Verify T%03d (%s)?" % (t["tid"], t["title"]),
+                    "done", "submitted result on file%s"
+                    % (", criteria: %s" % t["success_criteria"]
+                       if t["success_criteria"] else ""))
+                lines.append("Verified T%03d '%s' as done (submitted "
+                             "result recorded)."
+                             % (t["tid"], t["title"]))
+                actions += 1
+            else:
+                rt.db.decision_add(
+                    self.name, "Verify T%03d (%s)?" % (t["tid"], t["title"]),
+                    "escalated", "no submitted result; not assumed done")
+                lines.append("Escalated T%03d to you: it is marked "
+                             "verifying but no result was submitted."
+                             % t["tid"])
+                actions += 1
+
+        # 3. escalate overdue open work
+        for t in rt.db.tasks_overdue():
+            if actions >= MAX_REVIEW_ACTIONS:
+                lines.append("Review cap reached (%d actions); the rest "
+                             "waits for the next pass."
+                             % MAX_REVIEW_ACTIONS)
+                break
+            rt.db.decision_add(
+                self.name, "Escalate overdue T%03d?" % t["tid"],
+                "escalated", "deadline %s passed, status %s"
+                % (t["deadline"][:10], t["status"]))
+            lines.append("Escalated T%03d '%s': deadline %s passed "
+                         "(status %s)."
+                         % (t["tid"], t["title"], t["deadline"][:10],
+                            t["status"]))
+            actions += 1
+
+        if not lines:
+            lines.append("Nothing to delegate, verify or escalate; "
+                         "the board is quiet.")
+        report = "CEO review cycle (%d action(s)):\n%s" \
+            % (actions, "\n".join("  " + ln for ln in lines))
+        self.send("Owner", "review cycle", "%d action(s)" % actions)
+        return report
+
 
 class DeveloperAgent(Agent):
     def heuristic(self, text):
         builds = self.runtime.db.memory_count("agent", self.id)
-        tid = self.runtime.db.task_create("Review request: %s" % text[:48],
-                                          self.name, self.dept)
+        tid = self.runtime.db.task_create("Review request: %s" % text[:48],                                          self.name, self.dept)
         return ("Developer Agent online. Codebase v%s. I have built %d "
                 "agents so far. I logged your request as T%03d. "
                 "Restrictions in force: I cannot create or activate "
@@ -2344,7 +2676,7 @@ class Runtime:
         return ans in ("y", "yes")
 
     def reset_data(self):
-        for table in ("tasks", "bets", "memory", "decisions",
+        for table in ("tasks", "goals", "bets", "memory", "decisions",
                       "approvals", "log", "messages", "actions"):
             self.db.wipe_table(table)
         self.db.kv_set("bankroll", "%.2f" % INITIAL_BANKROLL)
@@ -2363,7 +2695,6 @@ class Runtime:
             "SELECT MAX(id) AS m FROM log").fetchone()
         self.db.kv_set("watchdog_cursor", str(row["m"] or 0))
 
-
 # --------------------------------------------------------------------- CLI
 
 HELP = """
@@ -2376,7 +2707,10 @@ Commands:
   scan                          run the betting value pipeline (simulation)
   report                        CEO daily report
   meeting <department>          department standup
-  tasks                         task board
+  tasks                         task board (with goals and verification)
+  goals                         strategic goals
+  goal <title> [| obj | crit | date]  create a strategic goal
+  review                        CEO review cycle (delegate, verify, escalate)
   bets                          bet ledger with PnL
   settle <id> <home|draw|away>  settle an open bet (approval)
   autonomy <on|off>             autonomous simulated betting (approval)
@@ -2420,6 +2754,9 @@ class CLI:
             "report": self.cmd_report,
             "meeting": self.cmd_meeting, "standup": self.cmd_meeting,
             "tasks": self.cmd_tasks, "task": self.cmd_tasks,
+            "goals": self.cmd_goals,
+            "goal": self.cmd_goal,
+            "review": self.cmd_review,
             "bets": self.cmd_bets,
             "settle": self.cmd_settle,
             "autonomy": self.cmd_autonomy,
@@ -2618,9 +2955,72 @@ class CLI:
         for t in rows:
             color = C.GREEN if t["status"] == "done" else (
                 C.RED if t["status"] == "failed" else C.YELLOW)
-            print("  %s%-6s%s %-7s %s[%s]%s %s  (%s)"
+            extra = ""
+            if t["goal_id"]:
+                extra += " goal G%03d" % t["goal_id"]
+            if t["deadline"]:
+                extra += " due %s" % t["deadline"][:10]
+            if t["status"] == "done" and t["verified_result"]:
+                extra += " [verified]"
+            elif t["status"] == "verifying":
+                extra += " [awaiting CEO verification]"
+            print("  %s%-6s%s %-7s %s[%s]%s %s  (%s)%s"
                   % (C.DIM, "T%03d" % t["tid"], C.RESET, t["priority"],
-                     color, t["status"], C.RESET, t["title"], t["owner"]))
+                     color, t["status"], C.RESET, t["title"], t["owner"],
+                     extra))
+
+    def cmd_goals(self, rest):
+        rt = self.rt
+        hdr("STRATEGIC GOALS")
+        rows = rt.db.goals_all()
+        if not rows:
+            print(wrap("No goals yet. Create one with: goal <title> "
+                       "[| objective | criteria | YYYY-MM-DD]"))
+            return
+        counts = rt.db.goal_task_counts()
+        for g in rows:
+            print("  %sG%03d%s [%s] %s  (%d task(s))"
+                  % (C.DIM, g["gid"], C.RESET, g["status"], g["title"],
+                     counts.get(g["gid"], 0)))
+            if g["objective"]:
+                print(wrap("      objective: %s" % g["objective"],
+                           "  " + C.DIM))
+            if g["success_criteria"]:
+                print(wrap("      criteria: %s" % g["success_criteria"],
+                           "  " + C.DIM))
+            if g["target_date"]:
+                print(wrap("      target: %s" % g["target_date"][:10],
+                           "  " + C.DIM))
+
+    def cmd_goal(self, rest):
+        rt = self.rt
+        if not rest:
+            print(wrap("Use: goal <title> [| objective | criteria | "
+                       "YYYY-MM-DD]  (the parts after '|' are optional)"))
+            return
+        parts = [p.strip() for p in rest.split("|")]
+        title = parts[0]
+        if not title:
+            print(wrap("The goal needs a title."))
+            return
+        objective = parts[1] if len(parts) > 1 else ""
+        criteria = parts[2] if len(parts) > 2 else ""
+        target = parts[3] if len(parts) > 3 else None
+        if target:
+            try:
+                datetime.strptime(target, "%Y-%m-%d")
+            except ValueError:
+                print(wrap("The target date must be YYYY-MM-DD, "
+                           "e.g. 2026-12-31."))
+                return
+        gid = rt.db.goal_create(title, objective, criteria, target)
+        rt.db.decision_add("Owner", "Create goal G%03d?" % gid,
+                           "created", title)
+        print(wrap("[CEO] Goal G%03d recorded: %s. I will report against "
+                   "it and attach delegated tasks to it." % (gid, title)))
+
+    def cmd_review(self, rest):
+        print_block("CEO Agent", self.rt.ceo.review_cycle())
 
     def cmd_bets(self, rest):
         rt = self.rt
@@ -2867,10 +3267,11 @@ class CLI:
         roster = json.loads(rt.db.kv_get("agents_json", "[]"))
         print(wrap("Agents: %d active in this session, %d on the persisted "
                    "roster" % (len(rt.agents), len(roster))))
-        print(wrap("Rows: %d tasks, %d bets, %d memory notes, %d "
-                   "decisions, %d approvals, %d messages, %d watched "
+        print(wrap("Rows: %d tasks, %d goals, %d bets, %d memory notes, "
+                   "%d decisions, %d approvals, %d messages, %d watched "
                    "actions, %d log entries"
-                   % (len(rt.db.tasks_all()), len(rt.db.bets_all()),
+                   % (len(rt.db.tasks_all()), len(rt.db.goals_all()),
+                      len(rt.db.bets_all()),
                       rt.db.memory_count_all(),
                       len(rt.db.decisions_all()),
                       rt.db.approvals_count(), rt.db.messages_count(),
@@ -2997,7 +3398,8 @@ class CLI:
 
     def banner(self):
         print(C.BOLD + C.MAGENTA + r"""
-    _   _                 ______    | \ | | _____   ____ _/ ____| __ _ _   _   _  __
+    _   _                 ______
+    | \ | | _____   ____ _/ ____| __ _ _   _   _  __
     |  \| |/ _ \ \ / / _` \___ \ / _` | | | \ \ / / /
     | |\  | (_) \ V / (_| |___) | (_| | |_| |\ V / /
     |_| \_|\___/ \_/ \__,_|____/ \__,_|\__, | \_/ /
